@@ -7,7 +7,7 @@ A macOS app that visualizes the geographic distribution of your photo library as
 - **Continuous gradient heatmap** — No bubbles or markers, just a smooth color gradient showing photo density
 - **Color scheme** — From blue (low density) through cyan, green, yellow, orange to red (high density)
 - **Dynamic detail** — Heatmap recalculates as you zoom and pan, showing more detail at higher zoom levels
-- **Adjustable intensity** — Slider to control the heat spread radius
+- **Heatmap options** — Adjust spread (applied on slider release), opacity, intensity, smoothing, and Classic / Ember / Ocean colors; restore the original defaults in one click
 - **Multiple map styles** — Standard, satellite, and hybrid views
 - **Privacy-first** — All processing happens locally on your Mac
 
@@ -68,3 +68,27 @@ Contributions are welcome! Feel free to open issues or submit pull requests.
 ## Acknowledgments
 
 - Built with SwiftUI, MapKit, and PhotoKit
+
+## Heatmap options
+
+Use **Hotspots** in the map toolbar to open the options panel. Spread is relative to the density grid in the current viewport, not a distance in meters or a pixel radius. Opacity, intensity, smoothing, and colors update the existing density grid without reading the photo library again. The legend follows the selected palette. Defaults preserve the original appearance: spread 50, opacity 70%, intensity 1×, smoothing 1×, and Classic colors.
+
+See [the heatmap options research](docs/heatmap-options-research.md) for the Leaflet.heat, MapLibre, and Kepler.gl references.
+
+Standalone appearance checks (no Photos access required):
+
+```bash
+xcrun swiftc PhotoDensityMap/Models/HeatmapAppearance.swift Tests/main.swift -o /tmp/heatmap-appearance-tests
+/tmp/heatmap-appearance-tests
+```
+
+## Map controls
+
+The native toolbar provides map styles, zoom controls, **All Photos**, and **Hotspots**. The first loaded photo library fits automatically; subsequent updates preserve your map position. The bottom status bar shows the photo count and selected density palette.
+
+- **⌘+ / ⌘−**: Zoom in / out
+- **⌘0**: Show all photos
+- **⌘⇧0**: Show the world
+- **⌘⇧H**: Open hotspot options
+
+Run `Tests/run-regressions.sh` for rendering and appearance checks and `Tests/run-map-navigation.sh` for viewport and navigation checks with Xcode selected.

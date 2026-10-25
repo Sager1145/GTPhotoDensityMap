@@ -16,7 +16,8 @@ struct PhotoDensityMapApp: App {
             ContentView()
                 .environmentObject(photoManager)
         }
-        .windowStyle(.hiddenTitleBar)
+        .windowStyle(.titleBar)
+        .windowToolbarStyle(.unified)
         .defaultSize(width: 1200, height: 800)
         .commands {
             CommandGroup(replacing: .newItem) { }
@@ -33,10 +34,15 @@ struct PhotoDensityMapApp: App {
                 
                 Divider()
                 
-                Button("Reset View") {
+                Button("Show All Photos") {
                     NotificationCenter.default.post(name: .resetView, object: nil)
                 }
                 .keyboardShortcut("0", modifiers: .command)
+
+                Button("Show World") {
+                    NotificationCenter.default.post(name: .worldView, object: nil)
+                }
+                .keyboardShortcut("0", modifiers: [.command, .shift])
             }
         }
     }
@@ -46,4 +52,5 @@ extension Notification.Name {
     static let zoomIn = Notification.Name("zoomIn")
     static let zoomOut = Notification.Name("zoomOut")
     static let resetView = Notification.Name("resetView")
+    static let worldView = Notification.Name("worldView")
 }

@@ -12,45 +12,51 @@ import Photos
 struct ContentView: View {
     @EnvironmentObject var photoManager: PhotoLocationManager
     @StateObject private var mapViewModel = MapViewModel()
+    @State private var heatmapAppearance = HeatmapAppearance()
     
     var body: some View {
         ZStack {
-            // Main Map View with Heatmap
             HeatmapMapView(
                 mapViewModel: mapViewModel,
                 photoLocations: photoManager.photoLocations,
-                heatmapData: photoManager.heatmapData
+                heatmapData: photoManager.heatmapData,
+                appearance: heatmapAppearance
             )
-            .ignoresSafeArea()
-            
-            // Overlay UI
-            VStack {
-                // Top bar with status and controls
-                HStack {
-                    StatusBarView(photoManager: photoManager)
-                    Spacer()
-                    MapControlsView(mapViewModel: mapViewModel, photoManager: photoManager)
-                }
-                .padding()
-                
-                Spacer()
-                
-                // Bottom legend
-                if !photoManager.photoLocations.isEmpty {
-                    HeatmapLegendView(maxDensity: photoManager.heatmapData?.maxDensity ?? 1)
-                        .padding()
-                }
-            }
-            
-            // Loading/Authorization overlay
+
             if photoManager.authorizationStatus == .notDetermined ||
                photoManager.authorizationStatus == .denied ||
+               photoManager.authorizationStatus == .restricted ||
                photoManager.isLoading {
                 AuthorizationOverlay(photoManager: photoManager)
             }
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            HStack(spacing: 16) {
+                StatusBarView(photoManager: photoManager)
+                Spacer(minLength: 12)
+                if !photoManager.photoLocations.isEmpty {
+                    HeatmapLegendView(palette: heatmapAppearance.palette)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.bar)
+            .overlay(alignment: .top) { Divider() }
+        }
+        .toolbar {
+            ToolbarItem(placement: .automatic) {
+                MapControlsView(mapViewModel: mapViewModel, photoManager: photoManager, appearance: $heatmapAppearance)
+            }
+        }
+        .frame(minWidth: 720, minHeight: 480)
+        .onChange(of: heatmapAppearance) { _, appearance in
+            photoManager.updateAppearance(appearance)
+        }
         .onAppear {
             photoManager.requestAuthorization()
+        }
+        .onChange(of: photoManager.photoLocations.count, initial: true) { _, _ in
+            mapViewModel.updatePhotoLocations(photoManager.photoLocations)
         }
         .onReceive(NotificationCenter.default.publisher(for: .zoomIn)) { _ in
             mapViewModel.zoomIn()
@@ -61,6 +67,9 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: .resetView)) { _ in
             mapViewModel.resetView()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .worldView)) { _ in
+            mapViewModel.showWorld()
+        }
     }
 }
 
@@ -70,13 +79,14 @@ struct HeatmapMapView: NSViewRepresentable {
     @ObservedObject var mapViewModel: MapViewModel
     let photoLocations: [PhotoLocation]
     let heatmapData: HeatmapData?
+    var appearance: HeatmapAppearance = HeatmapAppearance()
     
     func makeNSView(context: Context) -> MKMapView {
         let mapView = MKMapView()
         mapView.delegate = context.coordinator
         mapView.mapType = .standard
         mapView.showsCompass = true
-        mapView.showsZoomControls = true
+        mapView.showsZoomControls = false
         mapView.showsScale = true
         
         mapViewModel.mapView = mapView
@@ -93,8 +103,8 @@ struct HeatmapMapView: NSViewRepresentable {
             mapView.removeOverlays(existing)
             return
         }
-        guard existing.first?.heatmapData.id != heatmapData.id else { return }
-        let overlay = HeatmapOverlay(heatmapData: heatmapData)
+        guard existing.first?.heatmapData.id != heatmapData.id || existing.first?.appearance.opacity != appearance.opacity else { return }
+        let overlay = HeatmapOverlay(heatmapData: heatmapData, appearance: appearance)
         mapView.addOverlay(overlay, level: .aboveRoads)
         mapView.removeOverlays(existing)
     }
@@ -136,6 +146,7 @@ struct HeatmapMapView: NSViewRepresentable {
 
 class HeatmapOverlay: NSObject, MKOverlay {
     let heatmapData: HeatmapData
+    let appearance: HeatmapAppearance
     
     var coordinate: CLLocationCoordinate2D {
         MKMapPoint(x: boundingMapRect.midX, y: boundingMapRect.midY).coordinate
@@ -143,8 +154,9 @@ class HeatmapOverlay: NSObject, MKOverlay {
 
     var boundingMapRect: MKMapRect { heatmapData.mapRect }
 
-    init(heatmapData: HeatmapData) {
+    init(heatmapData: HeatmapData, appearance: HeatmapAppearance = HeatmapAppearance()) {
         self.heatmapData = heatmapData
+        self.appearance = appearance
         super.init()
     }
 }
@@ -165,7 +177,7 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
     }
     
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
-        guard overlay is HeatmapOverlay else { return }
+        guard let heatmapOverlay = overlay as? HeatmapOverlay else { return }
         
         let overlayRect = overlay.boundingMapRect
         
@@ -174,7 +186,7 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
         
         // Draw the heatmap
         context.saveGState()
-        context.setAlpha(0.7) // Semi-transparent overlay
+        context.setAlpha(heatmapOverlay.appearance.opacity)
         
         context.interpolationQuality = .high
         if let image = heatmapImage {
@@ -188,7 +200,7 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
 
 // Rasterize each immutable snapshot once, before publishing it to the UI.
 enum HeatmapRasterizer {
-    static func makeImage(grid: [[Double]], maxDensity: Double) -> CGImage? {
+    static func makeImage(grid: [[Double]], maxDensity: Double, appearance: HeatmapAppearance = HeatmapAppearance()) -> CGImage? {
         let gridWidth = grid.count
         let gridHeight = grid.first?.count ?? 0
         guard gridWidth > 0, gridHeight > 0 else { return nil }
@@ -219,8 +231,8 @@ enum HeatmapRasterizer {
             for y in 0..<gridHeight {
                 let density = grid[x][y]
                 if density > 0 {
-                    let color = colorForDensity(density / maxDensity)
-                    context.setFillColor(color)
+                    let color = appearance.palette.color(at: appearance.normalizedDensity(density / max(maxDensity, .leastNonzeroMagnitude)))
+                    context.setFillColor(CGColor(red: color.red, green: color.green, blue: color.blue, alpha: color.alpha))
                     
                     // Draw cell with slight overlap for smoother appearance
                     let rect = CGRect(
@@ -236,7 +248,7 @@ enum HeatmapRasterizer {
         
         // Apply Gaussian blur for smooth gradient effect
         if let image = context.makeImage() {
-            return applyBlur(to: image, radius: max(cellWidth, cellHeight) * 1.5)
+            return appearance.smoothing == 0 ? image : applyBlur(to: image, radius: max(cellWidth, cellHeight) * appearance.smoothing)
         }
         
         return context.makeImage()
@@ -257,61 +269,31 @@ enum HeatmapRasterizer {
         return ciContext.createCGImage(outputImage, from: extent)
     }
     
-    private static func colorForDensity(_ normalizedDensity: Double) -> CGColor {
-        // Google Photos style gradient: transparent -> blue -> cyan -> green -> yellow -> orange -> red
-        let density = max(0, min(1, normalizedDensity))
-        
-        // Color stops matching Google Photos heatmap
-        let colors: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)] = [
-            (0.0, 0.0, 1.0, 0.0),    // Transparent blue (density = 0)
-            (0.0, 0.4, 1.0, 0.4),    // Light blue
-            (0.0, 0.8, 1.0, 0.5),    // Cyan
-            (0.0, 1.0, 0.5, 0.6),    // Green-cyan
-            (0.5, 1.0, 0.0, 0.7),    // Yellow-green
-            (1.0, 1.0, 0.0, 0.75),   // Yellow
-            (1.0, 0.6, 0.0, 0.8),    // Orange
-            (1.0, 0.0, 0.0, 0.85)    // Red (density = 1)
-        ]
-        
-        let scaledDensity = density * Double(colors.count - 1)
-        let index = min(Int(scaledDensity), colors.count - 2)
-        let fraction = CGFloat(scaledDensity - Double(index))
-        
-        let c1 = colors[index]
-        let c2 = colors[index + 1]
-        
-        let r = c1.r + (c2.r - c1.r) * fraction
-        let g = c1.g + (c2.g - c1.g) * fraction
-        let b = c1.b + (c2.b - c1.b) * fraction
-        let a = c1.a + (c2.a - c1.a) * fraction
-        
-        return CGColor(red: r, green: g, blue: b, alpha: a)
-    }
 }
 
 // MARK: - Status Bar View
 
 struct StatusBarView: View {
     @ObservedObject var photoManager: PhotoLocationManager
-    
+
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Image(systemName: "photo.on.rectangle.angled")
-                .foregroundColor(.secondary)
-            
+                .foregroundStyle(.secondary)
             if photoManager.isLoading {
-                ProgressView()
-                    .scaleEffect(0.7)
-                Text("Loading photos...")
-                    .foregroundColor(.secondary)
+                ProgressView().controlSize(.small)
+                Text("Loading photo locations…")
+            } else if photoManager.authorizationStatus == .denied || photoManager.authorizationStatus == .restricted {
+                Text("Photo access unavailable")
+            } else if photoManager.photoLocations.isEmpty {
+                Text("No photos with location")
             } else {
-                Text("\(photoManager.totalPhotosWithLocation) photos with location")
-                    .foregroundColor(.primary)
+                Text("\(photoManager.totalPhotosWithLocation.formatted()) photos with location")
+                    .monospacedDigit()
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .font(.callout)
+        .help("Only photos with saved GPS locations appear on the map. Location data is processed on this Mac.")
     }
 }
 
@@ -320,56 +302,53 @@ struct StatusBarView: View {
 struct MapControlsView: View {
     @ObservedObject var mapViewModel: MapViewModel
     @ObservedObject var photoManager: PhotoLocationManager
-    
+    @Binding var appearance: HeatmapAppearance
+    @State private var showsHeatmapSettings = false
+
     var body: some View {
-        HStack(spacing: 8) {
-            // Heatmap intensity slider
-            HStack(spacing: 4) {
-                Image(systemName: "circle.dotted")
-                    .foregroundColor(.secondary)
-                    .font(.caption)
-                Slider(value: $photoManager.heatmapRadius, in: 10...100)
-                    .frame(width: 80)
-                Image(systemName: "circle.fill")
-                    .foregroundColor(.secondary)
-                    .font(.caption)
-            }
-            .padding(.horizontal, 8)
-            
-            Divider()
-                .frame(height: 20)
-            
-            Button(action: { mapViewModel.zoomIn() }) {
-                Image(systemName: "plus.magnifyingglass")
-            }
-            .buttonStyle(.bordered)
-            
-            Button(action: { mapViewModel.zoomOut() }) {
-                Image(systemName: "minus.magnifyingglass")
-            }
-            .buttonStyle(.bordered)
-            
-            Divider()
-                .frame(height: 20)
-            
+        HStack(spacing: 12) {
             Picker("Map Style", selection: $mapViewModel.mapStyle) {
-                Image(systemName: "map").tag(MapStyle.standard)
-                Image(systemName: "globe.americas").tag(MapStyle.satellite)
-                Image(systemName: "map.fill").tag(MapStyle.hybrid)
+                Text("Standard").tag(MapStyle.standard)
+                Text("Satellite").tag(MapStyle.satellite)
+                Text("Hybrid").tag(MapStyle.hybrid)
             }
-            .pickerStyle(.segmented)
-            .frame(width: 120)
+            .frame(width: 150)
+            .help("Choose the map background")
+
+            ControlGroup {
+                Button { mapViewModel.zoomOut() } label: {
+                    Label("Zoom Out", systemImage: "minus.magnifyingglass")
+                }
+                .help("Zoom out (⌘−)")
+                Button { mapViewModel.zoomIn() } label: {
+                    Label("Zoom In", systemImage: "plus.magnifyingglass")
+                }
+                .help("Zoom in (⌘+)")
+            }
+            .labelStyle(.iconOnly)
+
+            Button { mapViewModel.resetView() } label: {
+                Label("All Photos", systemImage: "arrow.up.left.and.arrow.down.right")
+            }
+            .disabled(!mapViewModel.canFitPhotos)
+            .help("Fit all photos with location in the map (⌘0)")
+
+            Button { showsHeatmapSettings.toggle() } label: {
+                Label("Hotspots", systemImage: "slider.horizontal.3")
+            }
+            .help("Adjust hotspot appearance (⌘⇧H)")
+            .keyboardShortcut("h", modifiers: [.command, .shift])
+            .popover(isPresented: $showsHeatmapSettings, arrowEdge: .bottom) {
+                HeatmapOptionsView(photoManager: photoManager, appearance: $appearance)
+            }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
 // MARK: - Heatmap Legend View
 
 struct HeatmapLegendView: View {
-    let maxDensity: Double
+    let palette: HeatmapPalette
     
     var body: some View {
         HStack(spacing: 16) {
@@ -378,8 +357,8 @@ struct HeatmapLegendView: View {
                 .font(.caption)
             
             // Gradient bar
-            HeatmapGradientBar()
-                .frame(width: 150, height: 12)
+            HeatmapGradientBar(palette: palette)
+                .frame(width: 90, height: 8)
                 .clipShape(Capsule())
             
             HStack(spacing: 4) {
@@ -394,24 +373,19 @@ struct HeatmapLegendView: View {
                     .foregroundColor(.secondary)
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 10)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .accessibilityElement(children: .combine)
+        .help("Relative photo density in the current map view: low to high")
     }
 }
 
 struct HeatmapGradientBar: View {
+    let palette: HeatmapPalette
+
     var body: some View {
         LinearGradient(
-            colors: [
-                Color(red: 0.0, green: 0.4, blue: 1.0),
-                Color(red: 0.0, green: 0.8, blue: 1.0),
-                Color(red: 0.0, green: 1.0, blue: 0.5),
-                Color(red: 0.5, green: 1.0, blue: 0.0),
-                Color(red: 1.0, green: 1.0, blue: 0.0),
-                Color(red: 1.0, green: 0.6, blue: 0.0),
-                Color(red: 1.0, green: 0.0, blue: 0.0)
-            ],
+            colors: palette.stops.dropFirst().map {
+                Color(red: $0.red, green: $0.green, blue: $0.blue)
+            },
             startPoint: .leading,
             endPoint: .trailing
         )
@@ -451,7 +425,7 @@ struct AuthorizationOverlay: View {
                                 .font(.caption)
                         }
                     }
-                } else if photoManager.authorizationStatus == .denied {
+                } else if photoManager.authorizationStatus == .denied || photoManager.authorizationStatus == .restricted {
                     VStack(spacing: 16) {
                         Image(systemName: "photo.badge.exclamationmark")
                             .font(.system(size: 60))

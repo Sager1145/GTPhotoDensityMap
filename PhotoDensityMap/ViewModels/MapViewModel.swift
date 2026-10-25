@@ -29,8 +29,8 @@ enum MapStyle: Int, CaseIterable {
 @MainActor
 class MapViewModel: ObservableObject {
     @Published var currentRegion: MKCoordinateRegion = MKCoordinateRegion(
-        center: CLLocationCoordinate2D(latitude: 45.4642, longitude: 9.1900), // Milan as default
-        span: MKCoordinateSpan(latitudeDelta: 10, longitudeDelta: 10)
+        center: CLLocationCoordinate2D(latitude: 20, longitude: 0),
+        span: MKCoordinateSpan(latitudeDelta: 140, longitudeDelta: 360)
     )
     
     @Published var mapStyle: MapStyle = .standard {
@@ -44,8 +44,13 @@ class MapViewModel: ObservableObject {
     weak var mapView: MKMapView? {
         didSet {
             mapView?.mapType = mapStyle.mapType
+            mapView?.setRegion(currentRegion, animated: false)
         }
     }
+
+    @Published private(set) var canFitPhotos = false
+    private var photoLocations: [PhotoLocation] = []
+    private var didFitInitialPhotos = false
     
     private var cancellables = Set<AnyCancellable>()
     
@@ -61,35 +66,37 @@ class MapViewModel: ObservableObject {
     
     // MARK: - Map Controls
     
-    func zoomIn() {
-        guard let mapView = mapView else { return }
-        
-        var region = mapView.region
-        region.span.latitudeDelta /= 2
-        region.span.longitudeDelta /= 2
-        
+    func zoomIn() { zoom(by: 0.5) }
+
+    func zoomOut() { zoom(by: 2) }
+
+    private func zoom(by factor: Double) {
+        var region = mapView?.region ?? currentRegion
+        region.span.latitudeDelta = min(170, max(0.0001, region.span.latitudeDelta * factor))
+        region.span.longitudeDelta = min(360, max(0.0001, region.span.longitudeDelta * factor))
         setRegion(region, animated: true)
     }
-    
-    func zoomOut() {
-        guard let mapView = mapView else { return }
-        
-        var region = mapView.region
-        region.span.latitudeDelta = min(region.span.latitudeDelta * 2, 180)
-        region.span.longitudeDelta = min(region.span.longitudeDelta * 2, 360)
-        
-        setRegion(region, animated: true)
+
+    /// Cache the complete loaded library and fit once, without undoing later pans.
+    func updatePhotoLocations(_ locations: [PhotoLocation]) {
+        photoLocations = locations
+        canFitPhotos = !locations.isEmpty
+        guard !didFitInitialPhotos, canFitPhotos else { return }
+        didFitInitialPhotos = true
+        fitToShow(locations: locations, animated: false)
     }
-    
+
     func resetView() {
-        // Reset to show entire world
-        let worldRegion = MKCoordinateRegion(
+        fitToShow(locations: photoLocations)
+    }
+
+    func showWorld() {
+        setRegion(MKCoordinateRegion(
             center: CLLocationCoordinate2D(latitude: 20, longitude: 0),
             span: MKCoordinateSpan(latitudeDelta: 140, longitudeDelta: 360)
-        )
-        setRegion(worldRegion, animated: true)
+        ), animated: true)
     }
-    
+
     func centerOn(coordinate: CLLocationCoordinate2D, span: MKCoordinateSpan? = nil) {
         let region = MKCoordinateRegion(
             center: coordinate,
@@ -98,29 +105,43 @@ class MapViewModel: ObservableObject {
         setRegion(region, animated: true)
     }
     
-    func fitToShow(locations: [PhotoLocation]) {
-        guard !locations.isEmpty else { return }
-        
-        let coordinates = locations.map(\.coordinate)
-        if let boundingBox = MKCoordinateRegion.boundingBox(for: coordinates) {
-            // Add some padding
-            var region = boundingBox
-            region.span.latitudeDelta *= 1.3
-            region.span.longitudeDelta *= 1.3
-            setRegion(region, animated: true)
+    func fitToShow(locations: [PhotoLocation], animated: Bool = true) {
+        let coordinates = locations.map(\.coordinate).filter { CLLocationCoordinate2DIsValid($0) }
+        guard !coordinates.isEmpty else { return }
+
+        // The complement of the largest longitude gap is the shortest arc that
+        // contains the library, including photos on both sides of the date line.
+        let longitudes = coordinates.map { ($0.longitude + 360).truncatingRemainder(dividingBy: 360) }.sorted()
+        var largestGap = -Double.infinity
+        var arcStart = longitudes[0]
+        for index in longitudes.indices {
+            let next = index + 1 < longitudes.count ? longitudes[index + 1] : longitudes[0] + 360
+            let gap = next - longitudes[index]
+            if gap > largestGap {
+                largestGap = gap
+                arcStart = next.truncatingRemainder(dividingBy: 360)
+            }
         }
+        let longitudeRange = 360 - largestGap
+        let longitudeCenter = (arcStart + longitudeRange / 2 + 180).truncatingRemainder(dividingBy: 360) - 180
+        let latitudes = coordinates.map { min(85, max(-85, $0.latitude)) }
+        let minLatitude = latitudes.min()!
+        let maxLatitude = latitudes.max()!
+        let latitudeSpan = min(170, max(0.05, (maxLatitude - minLatitude) * 1.3))
+        let latitudeCenter = min(85 - latitudeSpan / 2,
+                                 max(-85 + latitudeSpan / 2, (minLatitude + maxLatitude) / 2))
+        setRegion(MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: latitudeCenter, longitude: longitudeCenter),
+            span: MKCoordinateSpan(latitudeDelta: latitudeSpan,
+                                   longitudeDelta: min(360, max(0.05, longitudeRange * 1.3)))
+        ), animated: animated)
     }
-    
+
     private func setRegion(_ region: MKCoordinateRegion, animated: Bool) {
-        isAnimating = true
+        currentRegion = region
         mapView?.setRegion(region, animated: animated)
-        
-        // Reset animating flag after animation completes
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.isAnimating = false
-        }
     }
-    
+
     // MARK: - Zoom Level Calculation
     
     /// Returns a zoom level from 0 (world) to 20 (building level)

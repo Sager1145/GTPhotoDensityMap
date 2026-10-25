@@ -73,6 +73,32 @@ struct HeatmapRegression {
             fatalError("FAIL: renderer must reuse the worker-prepared raster")
         }
         print("PASS: new snapshots refresh, style changes retain the cached raster")
+        var appearance = HeatmapAppearance()
+        appearance.opacity = 0.2
+        host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: first, appearance: appearance)
+        host.layoutSubtreeIfNeeded()
+        pumpEvents()
+        guard let translucent = model.mapView?.overlays.first as? HeatmapOverlay,
+              translucent.appearance.opacity == 0.2,
+              translucent.heatmapData.image === first.image,
+              appearance.hasSameRaster(as: HeatmapAppearance()) else {
+            fatalError("FAIL: opacity must update drawing while preserving the cached image")
+        }
+        print("PASS: opacity updates drawing without rasterizing the density grid")
+        appearance.palette = .ember
+        appearance.intensity = 2
+        appearance.smoothing = 0
+        let restyled = first.restyled(appearance)
+        guard restyled.grid == first.grid, MKMapRectEqualToRect(restyled.mapRect, first.mapRect),
+              restyled.radius == first.radius, restyled.id != first.id,
+              restyled.appearance == appearance,
+              !first.appearance.hasSameRaster(as: appearance),
+              let newPixels = restyled.image?.dataProvider?.data,
+              let oldPixels = first.image?.dataProvider?.data,
+              !CFEqual(newPixels, oldPixels) else {
+            fatalError("FAIL: appearance changes must redraw the cached grid with new pixels")
+        }
+        print("PASS: appearance changes redraw cached density with the selected palette")
         host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [], heatmapData: nil)
         host.layoutSubtreeIfNeeded()
         pumpEvents()
@@ -104,4 +130,5 @@ extension Notification.Name {
     static let zoomIn = Notification.Name("zoomIn")
     static let zoomOut = Notification.Name("zoomOut")
     static let resetView = Notification.Name("resetView")
+    static let worldView = Notification.Name("worldView")
 }

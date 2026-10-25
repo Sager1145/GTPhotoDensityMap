@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A1000012 /* HeatmapOptionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000012 /* HeatmapOptionsView.swift */; };
+		A1000011 /* HeatmapAppearance.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000011 /* HeatmapAppearance.swift */; };
 		A1000001 /* PhotoDensityMapApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000001 /* PhotoDensityMapApp.swift */; };
 		A1000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000002 /* ContentView.swift */; };
 		A1000003 /* PhotoLocationManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000003 /* PhotoLocationManager.swift */; };
@@ -16,6 +18,8 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		A2000012 /* HeatmapOptionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeatmapOptionsView.swift; sourceTree = "<group>"; };
+		A2000011 /* HeatmapAppearance.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeatmapAppearance.swift; sourceTree = "<group>"; };
 		A2000001 /* PhotoDensityMapApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoDensityMapApp.swift; sourceTree = "<group>"; };
 		A2000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A2000003 /* PhotoLocationManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoLocationManager.swift; sourceTree = "<group>"; };
@@ -74,6 +78,7 @@
 			isa = PBXGroup;
 			children = (
 				A2000004 /* PhotoCluster.swift */,
+				A2000011 /* HeatmapAppearance.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -81,6 +86,7 @@
 		A5000005 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				A2000012 /* HeatmapOptionsView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -172,8 +178,10 @@
 			files = (
 				A1000001 /* PhotoDensityMapApp.swift in Sources */,
 				A1000002 /* ContentView.swift in Sources */,
+				A1000012 /* HeatmapOptionsView.swift in Sources */,
 				A1000003 /* PhotoLocationManager.swift in Sources */,
 				A1000004 /* PhotoCluster.swift in Sources */,
+				A1000011 /* HeatmapAppearance.swift in Sources */,
 				A1000006 /* MapViewModel.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

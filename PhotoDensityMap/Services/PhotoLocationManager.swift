@@ -23,9 +23,11 @@ struct HeatmapData {
     let cellSizeMapPoints: Double
     let image: CGImage?
     let radius: Double
+    let appearance: HeatmapAppearance
 
     init(grid: [[Double]], gridWidth: Int, gridHeight: Int, mapRect: MKMapRect,
-         maxDensity: Double, cellSizeMapPoints: Double, radius: Double = 50) {
+         maxDensity: Double, cellSizeMapPoints: Double, radius: Double = 50, appearance: HeatmapAppearance = HeatmapAppearance()) {
+        self.appearance = appearance
         self.radius = radius
         self.grid = grid
         self.gridWidth = gridWidth
@@ -34,11 +36,17 @@ struct HeatmapData {
         self.maxDensity = maxDensity
         self.cellSizeMapPoints = cellSizeMapPoints
         // Density calculation and raster preparation both run on the worker.
-        self.image = HeatmapRasterizer.makeImage(grid: grid, maxDensity: maxDensity)
+        self.image = HeatmapRasterizer.makeImage(grid: grid, maxDensity: maxDensity, appearance: appearance)
     }
     
     func canReuse(for rect: MKMapRect, cellSize: Double, radius: Double) -> Bool {
         self.radius == radius && cellSizeMapPoints == cellSize && mapRect.contains(rect)
+    }
+
+    func restyled(_ appearance: HeatmapAppearance) -> HeatmapData {
+        HeatmapData(grid: grid, gridWidth: gridWidth, gridHeight: gridHeight,
+                    mapRect: mapRect, maxDensity: maxDensity, cellSizeMapPoints: cellSizeMapPoints,
+                    radius: radius, appearance: appearance)
     }
 
     static func empty() -> HeatmapData {
@@ -76,6 +84,14 @@ class PhotoLocationManager: ObservableObject {
     
     // MARK: - Private Properties
     
+    private var heatmapAppearance = HeatmapAppearance()
+
+    func updateAppearance(_ appearance: HeatmapAppearance) {
+        let needsRaster = !heatmapAppearance.hasSameRaster(as: appearance)
+        heatmapAppearance = appearance
+        if needsRaster { regenerateHeatmap() }
+    }
+
     private var cancellables = Set<AnyCancellable>()
     private var currentHeatmapTask: Task<Void, Never>?
     private var currentMapRegion: MKCoordinateRegion?
@@ -200,6 +216,17 @@ class PhotoLocationManager: ObservableObject {
            data.canReuse(for: visibleRect, cellSize: Self.cellSize(for: visibleRect),
                          radius: heatmapRadius) {
             currentHeatmapTask?.cancel()
+            if !data.appearance.hasSameRaster(as: heatmapAppearance) {
+                let appearance = heatmapAppearance
+                currentHeatmapTask = Task.detached(priority: .userInitiated) { [weak self] in
+                    let refreshed = data.restyled(appearance)
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run { [weak self] in
+                        guard !Task.isCancelled else { return }
+                        self?.heatmapData = refreshed
+                    }
+                }
+            }
             return
         }
         generateHeatmap(for: region)
@@ -211,11 +238,12 @@ class PhotoLocationManager: ObservableObject {
         
         let locations = photoLocations
         let radius = heatmapRadius
+        let appearance = heatmapAppearance
         currentHeatmapTask = Task.detached(priority: .userInitiated) { [weak self] in
             let data = Self.calculateHeatmapData(
                 locations: locations,
                 region: region,
-                radius: radius
+                radius: radius, appearance: appearance
             )
             
             guard !Task.isCancelled else { return }
@@ -230,7 +258,7 @@ class PhotoLocationManager: ObservableObject {
     nonisolated static func calculateHeatmapData(
         locations: [PhotoLocation],
         region: MKCoordinateRegion,
-        radius: Double
+        radius: Double, appearance: HeatmapAppearance = HeatmapAppearance()
     ) -> HeatmapData {
         
         guard !locations.isEmpty else { return .empty() }
@@ -329,7 +357,7 @@ class PhotoLocationManager: ObservableObject {
             gridHeight: gridHeight,
             mapRect: mapRect,
             maxDensity: normalizedMaxDensity,
-            cellSizeMapPoints: cellSize, radius: radius
+            cellSizeMapPoints: cellSize, radius: radius, appearance: appearance
         )
     }
     
