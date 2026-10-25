@@ -85,15 +85,18 @@ struct HeatmapMapView: NSViewRepresentable {
     }
     
     func updateNSView(_ mapView: MKMapView, context: Context) {
-        // Remove existing heatmap overlay
-        let existingOverlays = mapView.overlays.filter { $0 is HeatmapOverlay }
-        mapView.removeOverlays(existingOverlays)
-        
-        // Add new heatmap overlay if we have data
-        if let heatmapData = heatmapData, !photoLocations.isEmpty {
-            let overlay = HeatmapOverlay(heatmapData: heatmapData)
-            mapView.addOverlay(overlay, level: .aboveRoads)
+        context.coordinator.parent = self
+        // Region/style publications do not invalidate the geographic overlay.
+        // Keep both it and its renderer alive while MapKit pans the map.
+        let existing = mapView.overlays.compactMap { $0 as? HeatmapOverlay }
+        guard let heatmapData, !photoLocations.isEmpty else {
+            mapView.removeOverlays(existing)
+            return
         }
+        guard existing.first?.heatmapData.id != heatmapData.id else { return }
+        let overlay = HeatmapOverlay(heatmapData: heatmapData)
+        mapView.addOverlay(overlay, level: .aboveRoads)
+        mapView.removeOverlays(existing)
     }
     
     func makeCoordinator() -> Coordinator {
@@ -135,30 +138,11 @@ class HeatmapOverlay: NSObject, MKOverlay {
     let heatmapData: HeatmapData
     
     var coordinate: CLLocationCoordinate2D {
-        heatmapData.boundingBox.center
+        MKMapPoint(x: boundingMapRect.midX, y: boundingMapRect.midY).coordinate
     }
-    
-    var boundingMapRect: MKMapRect {
-        // Calculate the corners of the bounding box
-        let northWest = MKMapPoint(CLLocationCoordinate2D(
-            latitude: heatmapData.boundingBox.center.latitude + heatmapData.boundingBox.span.latitudeDelta / 2,
-            longitude: heatmapData.boundingBox.center.longitude - heatmapData.boundingBox.span.longitudeDelta / 2
-        ))
-        let southEast = MKMapPoint(CLLocationCoordinate2D(
-            latitude: heatmapData.boundingBox.center.latitude - heatmapData.boundingBox.span.latitudeDelta / 2,
-            longitude: heatmapData.boundingBox.center.longitude + heatmapData.boundingBox.span.longitudeDelta / 2
-        ))
-        
-        // MKMapPoint Y increases as you go SOUTH (not north!)
-        // So northWest.y is smaller than southEast.y
-        return MKMapRect(
-            x: northWest.x,
-            y: northWest.y,
-            width: southEast.x - northWest.x,
-            height: southEast.y - northWest.y
-        )
-    }
-    
+
+    var boundingMapRect: MKMapRect { heatmapData.mapRect }
+
     init(heatmapData: HeatmapData) {
         self.heatmapData = heatmapData
         super.init()
@@ -168,42 +152,49 @@ class HeatmapOverlay: NSObject, MKOverlay {
 // MARK: - Heatmap Overlay Renderer
 
 class HeatmapOverlayRenderer: MKOverlayRenderer {
-    
-    private var cachedImage: CGImage?
-    private var cachedRect: MKMapRect?
+    // Immutable after initialization: MapKit may draw tiles concurrently.
+    let heatmapImage: CGImage?
+
+    override init(overlay: MKOverlay) {
+        if let heatmap = overlay as? HeatmapOverlay {
+            heatmapImage = heatmap.heatmapData.image
+        } else {
+            heatmapImage = nil
+        }
+        super.init(overlay: overlay)
+    }
     
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
-        guard let heatmapOverlay = overlay as? HeatmapOverlay else { return }
+        guard overlay is HeatmapOverlay else { return }
         
-        let heatmapData = heatmapOverlay.heatmapData
         let overlayRect = overlay.boundingMapRect
         
         // Calculate the drawing rect
         let drawRect = rect(for: overlayRect)
         
-        // Generate or use cached heatmap image
-        let image = generateHeatmapImage(
-            data: heatmapData,
-            size: CGSize(width: max(1, drawRect.width), height: max(1, drawRect.height)),
-            zoomScale: zoomScale
-        )
-        
         // Draw the heatmap
         context.saveGState()
         context.setAlpha(0.7) // Semi-transparent overlay
         
-        if let image = image {
+        context.interpolationQuality = .high
+        if let image = heatmapImage {
             context.draw(image, in: drawRect)
         }
         
         context.restoreGState()
     }
     
-    private func generateHeatmapImage(data: HeatmapData, size: CGSize, zoomScale: MKZoomScale) -> CGImage? {
-        let width = Int(max(1, min(size.width, 2048)))
-        let height = Int(max(1, min(size.height, 2048)))
-        
-        guard width > 0, height > 0 else { return nil }
+}
+
+// Rasterize each immutable snapshot once, before publishing it to the UI.
+enum HeatmapRasterizer {
+    static func makeImage(grid: [[Double]], maxDensity: Double) -> CGImage? {
+        let gridWidth = grid.count
+        let gridHeight = grid.first?.count ?? 0
+        guard gridWidth > 0, gridHeight > 0 else { return nil }
+        // Resolution belongs to the grid, not a changing map-space draw rect.
+        let width = gridWidth * 4
+        let height = gridHeight * 4
         
         // Create bitmap context
         let colorSpace = CGColorSpaceCreateDeviceRGB()
@@ -220,26 +211,21 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
         // Clear background
         context.clear(CGRect(x: 0, y: 0, width: width, height: height))
         
-        let gridWidth = data.grid.count
-        let gridHeight = data.grid.first?.count ?? 0
-        
-        guard gridWidth > 0, gridHeight > 0 else { return nil }
-        
         let cellWidth = CGFloat(width) / CGFloat(gridWidth)
         let cellHeight = CGFloat(height) / CGFloat(gridHeight)
         
         // Draw each cell with interpolated colors
         for x in 0..<gridWidth {
             for y in 0..<gridHeight {
-                let density = data.grid[x][y]
+                let density = grid[x][y]
                 if density > 0 {
-                    let color = colorForDensity(density / data.maxDensity)
+                    let color = colorForDensity(density / maxDensity)
                     context.setFillColor(color)
                     
                     // Draw cell with slight overlap for smoother appearance
                     let rect = CGRect(
                         x: CGFloat(x) * cellWidth - 1,
-                        y: CGFloat(gridHeight - 1 - y) * cellHeight - 1,
+                        y: CGFloat(y) * cellHeight - 1,
                         width: cellWidth + 2,
                         height: cellHeight + 2
                     )
@@ -256,7 +242,7 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
         return context.makeImage()
     }
     
-    private func applyBlur(to image: CGImage, radius: CGFloat) -> CGImage? {
+    private static func applyBlur(to image: CGImage, radius: CGFloat) -> CGImage? {
         let ciImage = CIImage(cgImage: image)
         
         let filter = CIFilter(name: "CIGaussianBlur")
@@ -271,7 +257,7 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
         return ciContext.createCGImage(outputImage, from: extent)
     }
     
-    private func colorForDensity(_ normalizedDensity: Double) -> CGColor {
+    private static func colorForDensity(_ normalizedDensity: Double) -> CGColor {
         // Google Photos style gradient: transparent -> blue -> cyan -> green -> yellow -> orange -> red
         let density = max(0, min(1, normalizedDensity))
         

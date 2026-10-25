@@ -14,21 +14,41 @@ import MapKit
 // MARK: - Heatmap Data Model
 
 struct HeatmapData {
+    let id = UUID()
     let grid: [[Double]]           // 2D grid of density values
     let gridWidth: Int
     let gridHeight: Int
-    let boundingBox: MKCoordinateRegion
+    let mapRect: MKMapRect
     let maxDensity: Double
-    let cellSizeDegrees: Double
+    let cellSizeMapPoints: Double
+    let image: CGImage?
+    let radius: Double
+
+    init(grid: [[Double]], gridWidth: Int, gridHeight: Int, mapRect: MKMapRect,
+         maxDensity: Double, cellSizeMapPoints: Double, radius: Double = 50) {
+        self.radius = radius
+        self.grid = grid
+        self.gridWidth = gridWidth
+        self.gridHeight = gridHeight
+        self.mapRect = mapRect
+        self.maxDensity = maxDensity
+        self.cellSizeMapPoints = cellSizeMapPoints
+        // Density calculation and raster preparation both run on the worker.
+        self.image = HeatmapRasterizer.makeImage(grid: grid, maxDensity: maxDensity)
+    }
     
+    func canReuse(for rect: MKMapRect, cellSize: Double, radius: Double) -> Bool {
+        self.radius == radius && cellSizeMapPoints == cellSize && mapRect.contains(rect)
+    }
+
     static func empty() -> HeatmapData {
         HeatmapData(
             grid: [],
             gridWidth: 0,
             gridHeight: 0,
-            boundingBox: MKCoordinateRegion(),
+            mapRect: .null,
             maxDensity: 0,
-            cellSizeDegrees: 0
+            cellSizeMapPoints: 0
         )
     }
 }
@@ -50,7 +70,7 @@ class PhotoLocationManager: ObservableObject {
     /// Controls the radius/spread of heat points (adjustable via UI)
     @Published var heatmapRadius: Double = 50 {
         didSet {
-            regenerateHeatmap()
+            regenerateHeatmap(force: true)
         }
     }
     
@@ -173,8 +193,15 @@ class PhotoLocationManager: ObservableObject {
         }
     }
     
-    private func regenerateHeatmap() {
+    private func regenerateHeatmap(force: Bool = false) {
         guard let region = currentMapRegion else { return }
+        let visibleRect = Self.projectedRect(for: region)
+        if !force, let data = heatmapData,
+           data.canReuse(for: visibleRect, cellSize: Self.cellSize(for: visibleRect),
+                         radius: heatmapRadius) {
+            currentHeatmapTask?.cancel()
+            return
+        }
         generateHeatmap(for: region)
     }
     
@@ -182,67 +209,69 @@ class PhotoLocationManager: ObservableObject {
         // Cancel any pending heatmap generation
         currentHeatmapTask?.cancel()
         
-        currentHeatmapTask = Task {
-            let data = await calculateHeatmapData(
-                locations: photoLocations,
+        let locations = photoLocations
+        let radius = heatmapRadius
+        currentHeatmapTask = Task.detached(priority: .userInitiated) { [weak self] in
+            let data = Self.calculateHeatmapData(
+                locations: locations,
                 region: region,
-                radius: heatmapRadius
+                radius: radius
             )
             
             guard !Task.isCancelled else { return }
             
-            await MainActor.run {
-                self.heatmapData = data
+            await MainActor.run { [weak self] in
+                guard !Task.isCancelled else { return }
+                self?.heatmapData = data
             }
         }
     }
     
-    private func calculateHeatmapData(
+    nonisolated static func calculateHeatmapData(
         locations: [PhotoLocation],
         region: MKCoordinateRegion,
         radius: Double
-    ) async -> HeatmapData {
+    ) -> HeatmapData {
         
         guard !locations.isEmpty else { return .empty() }
         
-        // Grid resolution based on view size (higher = more detail, slower)
-        let gridSize = 150
-        
-        // Calculate cell size in degrees
-        let cellSizeLat = region.span.latitudeDelta / Double(gridSize)
-        let cellSizeLon = region.span.longitudeDelta / Double(gridSize)
-        
-        // Create density grid
-        var grid = Array(repeating: Array(repeating: 0.0, count: gridSize), count: gridSize)
-        
-        // Bounds of the region
-        let minLat = region.center.latitude - region.span.latitudeDelta / 2
-        let minLon = region.center.longitude - region.span.longitudeDelta / 2
-        
-        // Radius in grid cells (affected by the slider)
+        // Use MapKit's projection and a world-anchored grid. Panning must not
+        // change the world-space bin of a photo or stretch latitude linearly.
+        let visibleRect = projectedRect(for: region)
+        let cellSize = cellSize(for: visibleRect)
+        let paddedRect = visibleRect.insetBy(dx: -visibleRect.width * 0.25,
+                                            dy: -visibleRect.height * 0.25)
+        let minX = floor(paddedRect.minX / cellSize) * cellSize
+        let minY = floor(paddedRect.minY / cellSize) * cellSize
+        let gridWidth = Int(ceil((paddedRect.maxX - minX) / cellSize))
+        let gridHeight = Int(ceil((paddedRect.maxY - minY) / cellSize))
+        let mapRect = MKMapRect(x: minX, y: minY,
+                               width: Double(gridWidth) * cellSize,
+                               height: Double(gridHeight) * cellSize)
+        var grid = Array(repeating: Array(repeating: 0.0, count: gridHeight), count: gridWidth)
         let radiusCells = Int(radius / 10) + 1
-        
-        // For each photo location, add heat to nearby cells
+
         for location in locations {
-            let lat = location.coordinate.latitude
-            let lon = location.coordinate.longitude
-            
-            // Convert to grid coordinates
-            let gridX = Int((lon - minLon) / cellSizeLon)
-            let gridY = Int((lat - minLat) / cellSizeLat)
-            
-            // Skip if outside grid
-            guard gridX >= 0 && gridX < gridSize && gridY >= 0 && gridY < gridSize else {
+            guard !Task.isCancelled else { return .empty() }
+            let point = MKMapPoint(location.coordinate)
+            // Choose the copy nearest the viewport when crossing the date line.
+            let worldWidth = MKMapRect.world.width
+            let x = point.x + round((mapRect.midX - point.x) / worldWidth) * worldWidth
+            let gridX = Int(floor((x - minX) / cellSize))
+            let gridY = Int(floor((point.y - minY) / cellSize))
+            // Include kernels whose centers lie just outside the raster.
+            guard gridX >= -radiusCells && gridX < gridWidth + radiusCells &&
+                  gridY >= -radiusCells && gridY < gridHeight + radiusCells else {
                 continue
             }
-            
+
             // Add heat with Gaussian falloff
             for dx in -radiusCells...radiusCells {
                 for dy in -radiusCells...radiusCells {
                     let nx = gridX + dx
                     let ny = gridY + dy
                     
-                    guard nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize else {
+                    guard nx >= 0 && nx < gridWidth && ny >= 0 && ny < gridHeight else {
                         continue
                     }
                     
@@ -296,14 +325,29 @@ class PhotoLocationManager: ObservableObject {
         
         return HeatmapData(
             grid: grid,
-            gridWidth: gridSize,
-            gridHeight: gridSize,
-            boundingBox: region,
+            gridWidth: gridWidth,
+            gridHeight: gridHeight,
+            mapRect: mapRect,
             maxDensity: normalizedMaxDensity,
-            cellSizeDegrees: cellSizeLat
+            cellSizeMapPoints: cellSize, radius: radius
         )
     }
     
+    nonisolated static func projectedRect(for region: MKCoordinateRegion) -> MKMapRect {
+        let north = min(85.05112878, region.center.latitude + region.span.latitudeDelta / 2)
+        let south = max(-85.05112878, region.center.latitude - region.span.latitudeDelta / 2)
+        let top = MKMapPoint(CLLocationCoordinate2D(latitude: north, longitude: region.center.longitude))
+        let bottom = MKMapPoint(CLLocationCoordinate2D(latitude: south, longitude: region.center.longitude))
+        let width = max(1, MKMapRect.world.width * min(360, region.span.longitudeDelta) / 360)
+        return MKMapRect(x: top.x - width / 2, y: top.y,
+                         width: width, height: max(1, bottom.y - top.y))
+    }
+
+    nonisolated static func cellSize(for rect: MKMapRect) -> Double {
+        // Quantized scale keeps the grid resolution stable throughout a pan.
+        pow(2, round(log2(max(rect.width, rect.height) / 150)))
+    }
+
     // MARK: - Statistics
     
     var dateRange: (earliest: Date, latest: Date)? {
