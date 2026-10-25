@@ -90,53 +90,217 @@ struct HeatmapMapView: NSViewRepresentable {
         mapView.showsScale = true
         
         mapViewModel.mapView = mapView
-        
+        context.coordinator.installInteractionMonitor(on: mapView)
+
         return mapView
     }
     
     func updateNSView(_ mapView: MKMapView, context: Context) {
         context.coordinator.parent = self
-        // Region/style publications do not invalidate the geographic overlay.
-        // Keep both it and its renderer alive while MapKit pans the map.
-        let existing = mapView.overlays.compactMap { $0 as? HeatmapOverlay }
-        guard let heatmapData, !photoLocations.isEmpty else {
-            mapView.removeOverlays(existing)
-            return
-        }
-        guard existing.first?.heatmapData.id != heatmapData.id || existing.first?.appearance.opacity != appearance.opacity else { return }
-        let overlay = HeatmapOverlay(heatmapData: heatmapData, appearance: appearance)
-        mapView.addOverlay(overlay, level: .aboveRoads)
-        mapView.removeOverlays(existing)
+        context.coordinator.updateHeatmap(on: mapView)
     }
-    
+
+    static func dismantleNSView(_ mapView: MKMapView, coordinator: Coordinator) {
+        coordinator.clear(on: mapView)
+        coordinator.removeInteractionMonitor()
+        mapView.delegate = nil
+    }
+
     func makeCoordinator() -> Coordinator {
         Coordinator(self)
     }
     
+    @MainActor
     class Coordinator: NSObject, MKMapViewDelegate {
         var parent: HeatmapMapView
-        
-        init(_ parent: HeatmapMapView) {
+        private var displayed: HeatmapOverlay?
+        private var incoming: HeatmapOverlay?
+        private var pending: (data: HeatmapData, appearance: HeatmapAppearance)?
+        private var renderers: [ObjectIdentifier: HeatmapOverlayRenderer] = [:]
+        private var transitionTimer: Timer?
+        private var transitionStart: TimeInterval = 0
+        private let transitionDuration: TimeInterval = 0.22
+        private let clock: () -> TimeInterval
+        private let reduceMotion: () -> Bool
+        private var interactionMonitor: Any?
+
+        init(_ parent: HeatmapMapView,
+             clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+             reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }) {
             self.parent = parent
+            self.clock = clock
+            self.reduceMotion = reduceMotion
         }
-        
-        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
-            if let heatmapOverlay = overlay as? HeatmapOverlay {
-                return HeatmapOverlayRenderer(overlay: heatmapOverlay)
+
+        deinit {
+            transitionTimer?.invalidate()
+            if let interactionMonitor { NSEvent.removeMonitor(interactionMonitor) }
+        }
+
+        func installInteractionMonitor(on mapView: MKMapView) {
+            removeInteractionMonitor()
+            // Only direct map interactions cancel a pending camera destination.
+            // Programmatic regionWillChange callbacks also occur during zooms.
+            interactionMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .scrollWheel, .magnify, .rotate]) {
+                [weak self, weak mapView] event in
+                if let mapView, mapView.window != nil, event.window === mapView.window,
+                   mapView.bounds.contains(mapView.convert(event.locationInWindow, from: nil)) {
+                    self?.parent.mapViewModel.mapInteractionBegan()
+                }
+                return event
             }
+        }
+
+        func removeInteractionMonitor() {
+            if let interactionMonitor { NSEvent.removeMonitor(interactionMonitor) }
+            interactionMonitor = nil
+        }
+
+        func updateHeatmap(on mapView: MKMapView) {
+            guard let data = parent.heatmapData, !parent.photoLocations.isEmpty else {
+                clear(on: mapView)
+                return
+            }
+            let appearance = parent.appearance
+            if reduceMotion() {
+                replaceImmediately(on: mapView, data: data, appearance: appearance)
+                return
+            }
+            // Compare against the latest destination, never the first overlay:
+            // that overlay deliberately remains visible during a crossfade.
+            if let pending {
+                guard !matches(pending.data, pending.appearance, data, appearance) else { return }
+            } else if let target = incoming ?? displayed,
+                      matches(target.heatmapData, target.appearance, data, appearance) {
+                return
+            }
+            if let incoming {
+                // A jump to a disjoint area has no visible old image to blend.
+                // Do not hold its new snapshot behind an unrelated transition.
+                guard data.image != nil,
+                      [displayed, incoming].compactMap({ $0 }).contains(where: {
+                          $0.heatmapData.image != nil && $0.boundingMapRect.intersects(data.mapRect)
+                      }) else {
+                    replaceImmediately(on: mapView, data: data, appearance: appearance)
+                    return
+                }
+                // Finish this short blend, coalescing any intermediate updates.
+                // Dropping a partly visible layer here would cause a brightness
+                // jump; one latest pending snapshot keeps overlay count at two.
+                pending = (data, appearance)
+                return
+            }
+            beginTransition(on: mapView, data: data, appearance: appearance, at: clock())
+        }
+
+        private func matches(_ first: HeatmapData, _ firstAppearance: HeatmapAppearance,
+                             _ second: HeatmapData, _ secondAppearance: HeatmapAppearance) -> Bool {
+            first.id == second.id && firstAppearance.opacity == secondAppearance.opacity
+        }
+
+        private func renderer(for overlay: HeatmapOverlay) -> HeatmapOverlayRenderer {
+            let key = ObjectIdentifier(overlay)
+            if let renderer = renderers[key] { return renderer }
+            let renderer = HeatmapOverlayRenderer(overlay: overlay)
+            renderers[key] = renderer
+            return renderer
+        }
+
+        private func beginTransition(on mapView: MKMapView, data: HeatmapData,
+                                     appearance: HeatmapAppearance, at time: TimeInterval) {
+            guard let displayed, displayed.heatmapData.image != nil, data.image != nil,
+                  displayed.boundingMapRect.intersects(data.mapRect) else {
+                replaceImmediately(on: mapView, data: data, appearance: appearance)
+                return
+            }
+            let next = HeatmapOverlay(heatmapData: data, appearance: appearance)
+            incoming = next
+            transitionStart = time
+            renderer(for: next).alpha = 0
+            mapView.addOverlay(next, level: .aboveRoads)
+            // All pixels already exist, so progress never depends on an optional
+            // MapKit renderer callback for an offscreen or not-yet-visible tile.
+            let timer = Timer(timeInterval: 1.0 / 60, repeats: true) { [weak self, weak mapView] _ in
+                // This timer is installed exclusively on RunLoop.main.
+                MainActor.assumeIsolated {
+                    guard let self, let mapView else { return }
+                    self.advanceTransition(on: mapView, at: self.clock())
+                }
+            }
+            transitionTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+
+        func advanceTransition(on mapView: MKMapView, at time: TimeInterval) {
+            guard let incoming, let displayed else { return }
+            if reduceMotion() {
+                let target = pending ?? (incoming.heatmapData, incoming.appearance)
+                replaceImmediately(on: mapView, data: target.data, appearance: target.appearance)
+                return
+            }
+            let progress = max(0, min(1, (time - transitionStart) / transitionDuration))
+            let eased = progress * progress * (3 - 2 * progress)
+            renderer(for: displayed).alpha = CGFloat(1 - eased)
+            renderer(for: incoming).alpha = CGFloat(eased)
+            if progress >= 1 {
+                transitionTimer?.invalidate()
+                transitionTimer = nil
+                mapView.removeOverlay(displayed)
+                renderers.removeValue(forKey: ObjectIdentifier(displayed))
+                self.displayed = incoming
+                self.incoming = nil
+                if let target = pending {
+                    pending = nil
+                    guard !matches(incoming.heatmapData, incoming.appearance, target.data, target.appearance) else { return }
+                    beginTransition(on: mapView, data: target.data, appearance: target.appearance, at: time)
+                }
+            }
+        }
+
+        private func replaceImmediately(on mapView: MKMapView, data: HeatmapData,
+                                        appearance: HeatmapAppearance) {
+            transitionTimer?.invalidate()
+            transitionTimer = nil
+            pending = nil
+            let existing = mapView.overlays.compactMap { $0 as? HeatmapOverlay }
+            let target = existing.first { matches($0.heatmapData, $0.appearance, data, appearance) }
+                ?? HeatmapOverlay(heatmapData: data, appearance: appearance)
+            let targetRenderer = renderer(for: target)
+            targetRenderer.alpha = 1
+            if !existing.contains(where: { $0 === target }) {
+                mapView.addOverlay(target, level: .aboveRoads)
+            }
+            mapView.removeOverlays(existing.filter { $0 !== target })
+            renderers = [ObjectIdentifier(target): targetRenderer]
+            displayed = target
+            incoming = nil
+        }
+
+        func clear(on mapView: MKMapView) {
+            transitionTimer?.invalidate()
+            transitionTimer = nil
+            pending = nil
+            displayed = nil
+            incoming = nil
+            mapView.removeOverlays(mapView.overlays.filter { $0 is HeatmapOverlay })
+            renderers.removeAll()
+        }
+
+        func mapView(_ mapView: MKMapView, rendererFor overlay: MKOverlay) -> MKOverlayRenderer {
+            if let overlay = overlay as? HeatmapOverlay { return renderer(for: overlay) }
             return MKOverlayRenderer(overlay: overlay)
         }
-        
+
         func mapView(_ mapView: MKMapView, regionDidChangeAnimated animated: Bool) {
-            // Dispatch updates asynchronously to avoid publishing changes during view updates
-            DispatchQueue.main.async {
-                self.parent.mapViewModel.currentRegion = mapView.region
-                
-                // Trigger heatmap recalculation based on new zoom level
-                NotificationCenter.default.post(
-                    name: .mapRegionChanged,
-                    object: mapView.region
-                )
+            // MapKit may fit or constrain the requested region. Its current
+            // viewport is authoritative, independent of camera-target bookkeeping.
+            // Read it when this deferred update runs so an interrupted animation
+            // cannot enqueue an older viewport after a newer camera command.
+            DispatchQueue.main.async { [weak self, weak mapView] in
+                guard let self, let mapView, mapView.delegate === self else { return }
+                let actualRegion = mapView.region
+                self.parent.mapViewModel.mapRegionDidChange(actualRegion)
+                NotificationCenter.default.post(name: .mapRegionChanged, object: actualRegion)
             }
         }
     }

@@ -16,6 +16,8 @@ struct HeatmapRegression {
                                span: .init(latitudeDelta: 10, longitudeDelta: 10))),
             maxDensity: 1, cellSizeMapPoints: 1
         )
+        transitionChecks(location: location, data: data)
+        nativeViewportChecks(location: location, data: data)
         let host = NSHostingView(rootView: HeatmapMapView(
             mapViewModel: model, photoLocations: [location], heatmapData: data))
         host.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
@@ -56,7 +58,12 @@ struct HeatmapRegression {
         // New data must replace the old snapshot, while style changes must not.
         host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: first)
         host.layoutSubtreeIfNeeded()
-        pumpEvents()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.03))
+        guard map.overlays.count == 2, map.overlays.contains(where: { $0 === original }) else {
+            fatalError("FAIL: a new snapshot must retain the old overlay during its crossfade")
+        }
+        print("PASS: snapshot replacement retains the old image during the transition")
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
         guard let refreshedMap = model.mapView,
               refreshedMap.overlays.count == 1,
               let replacement = refreshedMap.overlays.first as? HeatmapOverlay,
@@ -78,6 +85,7 @@ struct HeatmapRegression {
         host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: first, appearance: appearance)
         host.layoutSubtreeIfNeeded()
         pumpEvents()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
         guard let translucent = model.mapView?.overlays.first as? HeatmapOverlay,
               translucent.appearance.opacity == 0.2,
               translucent.heatmapData.image === first.image,
@@ -105,6 +113,150 @@ struct HeatmapRegression {
         guard model.mapView?.overlays.isEmpty == true else { fatalError("FAIL: clearing data left a stale overlay") }
         print("PASS: clearing data removes the overlay")
         withExtendedLifetime(host) {}
+    }
+
+    @MainActor
+    static func nativeViewportChecks(location: PhotoLocation, data: HeatmapData) {
+        let model = MapViewModel(reduceMotion: { false })
+        let map = MKMapView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+        let coordinator = HeatmapMapView.Coordinator(HeatmapMapView(
+            mapViewModel: model, photoLocations: [location], heatmapData: data))
+        map.delegate = coordinator
+        model.mapView = map
+        var received: MKCoordinateRegion?
+        let observation = NotificationCenter.default.publisher(for: .mapRegionChanged).sink {
+            received = $0.object as? MKCoordinateRegion
+        }
+        let globalLibrary = [-135.0, -45.0, 45.0, 135.0].enumerated().map {
+            PhotoLocation(id: String($0.offset), coordinate: .init(latitude: 20, longitude: $0.element))
+        }
+        model.updatePhotoLocations(globalLibrary)
+        for _ in 0..<3 { model.zoomIn() }
+        model.zoomOut()
+        model.zoomOut()
+        model.zoomIn()
+        model.resetView()
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.15))
+        guard let received, !model.isAnimating,
+              abs(received.span.longitudeDelta - map.region.span.longitudeDelta) < 0.000001,
+              abs(received.center.longitude - map.region.center.longitude) < 0.000001 else {
+            fatalError("FAIL: native All Photos must publish its actual constrained viewport to the heatmap")
+        }
+        withExtendedLifetime(observation) {}
+        HeatmapMapView.dismantleNSView(map, coordinator: coordinator)
+        print("PASS: native rapid zoom and All Photos publish the actual viewport for heatmap regeneration")
+    }
+
+    @MainActor
+    static func transitionChecks(location: PhotoLocation, data: HeatmapData) {
+        let model = MapViewModel()
+        let map = MKMapView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        var now: TimeInterval = 10
+        var reducedMotion = false
+        func view(_ data: HeatmapData, _ appearance: HeatmapAppearance = .init()) -> HeatmapMapView {
+            HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: data, appearance: appearance)
+        }
+        let coordinator = HeatmapMapView.Coordinator(view(data), clock: { now }, reduceMotion: { reducedMotion })
+        map.delegate = coordinator
+        coordinator.updateHeatmap(on: map)
+        guard let original = map.overlays.first as? HeatmapOverlay else { fatalError("FAIL: initial image missing") }
+        var appearance = HeatmapAppearance()
+        appearance.palette = .ember
+        let second = data.restyled(appearance)
+        coordinator.parent = view(second, appearance)
+        coordinator.updateHeatmap(on: map)
+        guard map.overlays.count == 2, map.overlays.contains(where: { $0 === original }),
+              let next = map.overlays.last as? HeatmapOverlay else {
+            fatalError("FAIL: replacement removed its outgoing image before the transition")
+        }
+        let outgoingRenderer = coordinator.mapView(map, rendererFor: original)
+        let incomingRenderer = coordinator.mapView(map, rendererFor: next)
+        guard outgoingRenderer.alpha == 1, incomingRenderer.alpha == 0 else {
+            fatalError("FAIL: transition must start with the old image visible and new image transparent")
+        }
+        now += 0.11
+        coordinator.advanceTransition(on: map, at: now)
+        guard abs(outgoingRenderer.alpha - 0.5) < 0.01,
+              abs(incomingRenderer.alpha - 0.5) < 0.01,
+              (incomingRenderer as? HeatmapOverlayRenderer)?.heatmapImage === second.image else {
+            fatalError("FAIL: halfway transition must blend existing cached images")
+        }
+        print("PASS: deterministic crossfade retains and blends the cached geographic images")
+
+        appearance.intensity = 1.5
+        let skipped = data.restyled(appearance)
+        coordinator.parent = view(skipped, appearance)
+        coordinator.updateHeatmap(on: map)
+        appearance.intensity = 2
+        let latest = data.restyled(appearance)
+        coordinator.parent = view(latest, appearance)
+        for _ in 0..<20 { coordinator.updateHeatmap(on: map) }
+        guard map.overlays.count == 2 else { fatalError("FAIL: rapid updates accumulated overlays") }
+        now += 0.12
+        coordinator.advanceTransition(on: map, at: now)
+        guard map.overlays.count == 2,
+              !map.overlays.contains(where: { ($0 as? HeatmapOverlay)?.heatmapData.id == skipped.id }),
+              map.overlays.contains(where: { ($0 as? HeatmapOverlay)?.heatmapData.id == latest.id }) else {
+            fatalError("FAIL: a rapid transition must coalesce to the latest pending image")
+        }
+        now += 0.23
+        coordinator.advanceTransition(on: map, at: now)
+        guard map.overlays.count == 1, let final = map.overlays.first as? HeatmapOverlay,
+              final.heatmapData.id == latest.id,
+              coordinator.mapView(map, rendererFor: final).alpha == 1 else {
+            fatalError("FAIL: completed transitions must leave only the latest image at full opacity")
+        }
+        print("PASS: rapid updates stay at two overlays, latest wins, and completion removes old layers")
+
+        coordinator.parent = view(data)
+        coordinator.updateHeatmap(on: map)
+        let remote = HeatmapData(grid: data.grid, gridWidth: data.gridWidth, gridHeight: data.gridHeight,
+                                 mapRect: MKMapRect(x: data.mapRect.maxX + data.mapRect.width,
+                                                    y: data.mapRect.minY,
+                                                    width: data.mapRect.width, height: data.mapRect.height),
+                                 maxDensity: data.maxDensity, cellSizeMapPoints: data.cellSizeMapPoints)
+        coordinator.parent = view(remote)
+        coordinator.updateHeatmap(on: map)
+        guard map.overlays.count == 1,
+              (map.overlays.first as? HeatmapOverlay)?.heatmapData.id == remote.id else {
+            fatalError("FAIL: jumping outside an active blend must show the new area immediately")
+        }
+        now += 1
+        coordinator.advanceTransition(on: map, at: now)
+        guard (map.overlays.first as? HeatmapOverlay)?.heatmapData.id == remote.id else {
+            fatalError("FAIL: a canceled cross-area transition restored a stale image")
+        }
+        print("PASS: cross-area updates interrupt an active blend immediately")
+
+        coordinator.parent = view(data)
+        coordinator.updateHeatmap(on: map)
+        coordinator.parent = view(second, appearance)
+        coordinator.updateHeatmap(on: map)
+        reducedMotion = true
+        now += 0.01
+        coordinator.advanceTransition(on: map, at: now)
+        guard map.overlays.count == 1,
+              (map.overlays.first as? HeatmapOverlay)?.heatmapData.id == second.id else {
+            fatalError("FAIL: Reduce Motion must cancel the blend and show the latest requested image")
+        }
+        print("PASS: Reduce Motion cancels an active blend and displays the latest image immediately")
+
+        reducedMotion = false
+        coordinator.parent = view(data)
+        coordinator.updateHeatmap(on: map)
+        coordinator.clear(on: map)
+        now += 1
+        coordinator.advanceTransition(on: map, at: now)
+        guard map.overlays.isEmpty else { fatalError("FAIL: cleared data was restored by a stale transition") }
+        coordinator.parent = view(latest, appearance)
+        coordinator.updateHeatmap(on: map)
+        HeatmapMapView.dismantleNSView(map, coordinator: coordinator)
+        now += 1
+        coordinator.advanceTransition(on: map, at: now)
+        guard map.overlays.isEmpty, map.delegate == nil else {
+            fatalError("FAIL: dismantling must cancel and remove transition state")
+        }
+        print("PASS: clearing and dismantling cancel transition cleanup without restoring stale overlays")
     }
 
     static func peak(_ data: HeatmapData) -> MKMapPoint {

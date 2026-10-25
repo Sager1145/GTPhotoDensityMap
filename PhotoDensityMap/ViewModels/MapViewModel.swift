@@ -8,6 +8,7 @@
 import Foundation
 import MapKit
 import Combine
+import AppKit
 
 enum MapStyle: Int, CaseIterable {
     case standard
@@ -51,10 +52,17 @@ class MapViewModel: ObservableObject {
     @Published private(set) var canFitPhotos = false
     private var photoLocations: [PhotoLocation] = []
     private var didFitInitialPhotos = false
+    private var pendingZoomRegion: MKCoordinateRegion?
+    private var lastZoomInputTime: TimeInterval?
+    private let reduceMotion: () -> Bool
+    private let clock: () -> TimeInterval
     
     private var cancellables = Set<AnyCancellable>()
     
-    init() {
+    init(reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion },
+         clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
+        self.reduceMotion = reduceMotion
+        self.clock = clock
         // Observe map style changes
         $mapStyle
             .dropFirst() // Skip the initial value since it's already set
@@ -71,10 +79,17 @@ class MapViewModel: ObservableObject {
     func zoomOut() { zoom(by: 2) }
 
     private func zoom(by factor: Double) {
-        var region = mapView?.region ?? currentRegion
+        // Accumulate only a short burst of inputs. MapKit may clamp its final
+        // camera differently from regionThatFits, so targets cannot determine
+        // when an animation has finished or remain the basis of future zooms.
+        let now = clock()
+        let continuesBurst = lastZoomInputTime.map { now - $0 < 0.35 } ?? false
+        var region = (continuesBurst ? pendingZoomRegion : nil) ?? mapView?.region ?? currentRegion
         region.span.latitudeDelta = min(170, max(0.0001, region.span.latitudeDelta * factor))
         region.span.longitudeDelta = min(360, max(0.0001, region.span.longitudeDelta * factor))
         setRegion(region, animated: true)
+        pendingZoomRegion = mapView?.regionThatFits(region) ?? region
+        lastZoomInputTime = now
     }
 
     /// Cache the complete loaded library and fit once, without undoing later pans.
@@ -138,8 +153,28 @@ class MapViewModel: ObservableObject {
     }
 
     private func setRegion(_ region: MKCoordinateRegion, animated: Bool) {
+        pendingZoomRegion = nil
+        lastZoomInputTime = nil
         currentRegion = region
-        mapView?.setRegion(region, animated: animated)
+        let shouldAnimate = animated && !reduceMotion()
+        isAnimating = shouldAnimate && mapView != nil
+        mapView?.setRegion(region, animated: shouldAnimate)
+    }
+
+    /// Call when a user starts dragging, scrolling, or gesturing on the map.
+    func mapInteractionBegan() {
+        pendingZoomRegion = nil
+        lastZoomInputTime = nil
+        isAnimating = false
+    }
+
+    /// Reconcile MapKit's fitted viewport when its camera transition finishes.
+    func mapRegionDidChange(_ region: MKCoordinateRegion) {
+        // Delegate completion describes the actual legal camera, including
+        // MapKit's constraints. It must never wait for a predicted span match.
+        // Keep the short input burst independent of interrupted completions.
+        isAnimating = false
+        currentRegion = region
     }
 
     // MARK: - Zoom Level Calculation
