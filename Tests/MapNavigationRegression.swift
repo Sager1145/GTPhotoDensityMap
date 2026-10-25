@@ -7,7 +7,7 @@ struct MapNavigationRegression {
     static func main() {
         let model = MapViewModel()
         let tokyo = PhotoLocation(id: "tokyo", coordinate: .init(latitude: 35.68, longitude: 139.69))
-        model.fitToShow(locations: [tokyo])
+        model.updatePhotoLocations([tokyo])
         check(abs(model.currentRegion.center.latitude - 35.68) < 0.01,
               "Fit All must update the requested viewport even before the map is attached")
         check(model.currentRegion.span.latitudeDelta > 0 && model.currentRegion.span.latitudeDelta < 1,
@@ -16,7 +16,8 @@ struct MapNavigationRegression {
             PhotoLocation(id: "east", coordinate: .init(latitude: 10, longitude: 179)),
             PhotoLocation(id: "west", coordinate: .init(latitude: 11, longitude: -179))
         ]
-        model.fitToShow(locations: pacific)
+        model.updatePhotoLocations(pacific)
+        model.resetView()
         check(model.currentRegion.span.longitudeDelta < 10,
               "Photos across the date line must fit locally instead of spanning the world")
         model.zoomIn()
@@ -24,7 +25,8 @@ struct MapNavigationRegression {
         model.zoomOut()
         check(model.currentRegion.span.longitudeDelta > zoomedSpan, "Zoom controls must change the viewport")
         let previous = model.currentRegion
-        model.fitToShow(locations: [])
+        model.updatePhotoLocations([])
+        model.resetView()
         check(model.currentRegion.center.latitude == previous.center.latitude,
               "An empty photo set must leave the viewport alone")
         let library = MapViewModel()
@@ -33,7 +35,13 @@ struct MapNavigationRegression {
         library.updatePhotoLocations([tokyo])
         check(library.canFitPhotos && abs(library.currentRegion.center.latitude - 35.68) < 0.01,
               "The first nonempty library must fit automatically")
-        library.centerOn(coordinate: .init(latitude: 48, longitude: 2))
+        let paris = PhotoLocation(id: "paris", coordinate: .init(latitude: 48, longitude: 2))
+        library.updatePhotoLocations([paris])
+        library.resetView()
+        check(abs(library.currentRegion.center.latitude - 48) < 0.01,
+              "A replacement library with the same count must refresh the cached fit")
+        library.mapRegionDidChange(.init(center: .init(latitude: 48, longitude: 2),
+                                        span: .init(latitudeDelta: 1, longitudeDelta: 1)))
         library.updatePhotoLocations(pacific)
         check(library.currentRegion.center.latitude == 48,
               "Later library updates must preserve the user's map position")
@@ -87,7 +95,7 @@ struct MapNavigationRegression {
         camera.zoomOut()
         check(abs(laggingMap.requests.last!.region.span.longitudeDelta - 24.002) < 0.00001,
               "After the input burst expires, zoom must use MapKit's actual viewport")
-        camera.centerOn(coordinate: .init(latitude: 35, longitude: 139))
+        camera.showWorld()
         laggingMap.displayedRegion = MKCoordinateRegion(
             center: .init(latitude: 35, longitude: 139),
             span: .init(latitudeDelta: 2, longitudeDelta: 4)
@@ -103,7 +111,7 @@ struct MapNavigationRegression {
         accessibleCamera.zoomIn()
         check(!accessibleMap.requests.last!.animated && !accessibleCamera.isAnimating,
               "Reduce Motion must apply zoom immediately without animation")
-        accessibleCamera.centerOn(coordinate: .init(latitude: 1, longitude: 2))
+        accessibleCamera.showWorld()
         check(!accessibleMap.requests.last!.animated,
               "Reduce Motion must also apply to other camera controls")
         prefersReducedMotion = false
@@ -115,6 +123,8 @@ struct MapNavigationRegression {
         let observer = NativeNavigationObserver(nativeCamera)
         nativeMap.delegate = observer
         nativeCamera.mapView = nativeMap
+        nativeCamera.mapStyle = .hybrid
+        check(nativeMap.mapType == .hybrid, "Map style must update the attached native map")
         let globalLibrary = [-135.0, -45.0, 45.0, 135.0].enumerated().map {
             PhotoLocation(id: String($0.offset), coordinate: .init(latitude: 20, longitude: $0.element))
         }

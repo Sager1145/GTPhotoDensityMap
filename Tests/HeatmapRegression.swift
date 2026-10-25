@@ -20,7 +20,7 @@ struct HeatmapRegression {
         transitionChecks(location: location, data: data)
         nativeViewportChecks(location: location, data: data)
         let host = NSHostingView(rootView: HeatmapMapView(
-            mapViewModel: model, photoLocations: [location], heatmapData: data))
+            mapViewModel: model, heatmapData: data))
         host.frame = NSRect(x: 0, y: 0, width: 800, height: 600)
         host.layoutSubtreeIfNeeded()
         pumpEvents()
@@ -57,7 +57,7 @@ struct HeatmapRegression {
         }
         print("PASS: intensity changes invalidate the cached snapshot")
         // New data must replace the old snapshot, while style changes must not.
-        host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: first)
+        host.rootView = HeatmapMapView(mapViewModel: model, heatmapData: first)
         host.layoutSubtreeIfNeeded()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.03))
         guard map.overlays.count == 2, map.overlays.contains(where: { $0 === original }) else {
@@ -83,7 +83,7 @@ struct HeatmapRegression {
         print("PASS: new snapshots refresh, style changes retain the cached raster")
         var appearance = HeatmapAppearance()
         appearance.opacity = 0.2
-        host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: first, appearance: appearance)
+        host.rootView = HeatmapMapView(mapViewModel: model, heatmapData: first, appearance: appearance)
         host.layoutSubtreeIfNeeded()
         pumpEvents()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.3))
@@ -108,7 +108,7 @@ struct HeatmapRegression {
             fatalError("FAIL: appearance changes must redraw the cached grid with new pixels")
         }
         print("PASS: appearance changes redraw cached density with the selected palette")
-        host.rootView = HeatmapMapView(mapViewModel: model, photoLocations: [], heatmapData: nil)
+        host.rootView = HeatmapMapView(mapViewModel: model, heatmapData: nil)
         host.layoutSubtreeIfNeeded()
         pumpEvents()
         guard model.mapView?.overlays.isEmpty == true else { fatalError("FAIL: clearing data left a stale overlay") }
@@ -121,7 +121,7 @@ struct HeatmapRegression {
         let model = MapViewModel()
         let map = MKMapView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
         func view(_ data: HeatmapData, _ appearance: HeatmapAppearance) -> HeatmapMapView {
-            HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: data, appearance: appearance)
+            HeatmapMapView(mapViewModel: model, heatmapData: data, appearance: appearance)
         }
         var appearance = HeatmapAppearance()
         let coordinator = HeatmapMapView.Coordinator(view(data, appearance), reduceMotion: { false })
@@ -198,14 +198,18 @@ struct HeatmapRegression {
     static func nativeViewportChecks(location: PhotoLocation, data: HeatmapData) {
         let model = MapViewModel(reduceMotion: { false })
         let map = MKMapView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
+        var received: MKCoordinateRegion?
+        var unrelatedReceived = false
+        let unrelatedModel = MapViewModel()
+        let unrelatedMap = MKMapView(frame: .zero)
+        let unrelatedCoordinator = HeatmapMapView.Coordinator(HeatmapMapView(
+            mapViewModel: unrelatedModel, heatmapData: nil,
+            onRegionChange: { _ in unrelatedReceived = true }))
+        unrelatedMap.delegate = unrelatedCoordinator
         let coordinator = HeatmapMapView.Coordinator(HeatmapMapView(
-            mapViewModel: model, photoLocations: [location], heatmapData: data))
+            mapViewModel: model, heatmapData: data, onRegionChange: { received = $0 }))
         map.delegate = coordinator
         model.mapView = map
-        var received: MKCoordinateRegion?
-        let observation = NotificationCenter.default.publisher(for: .mapRegionChanged).sink {
-            received = $0.object as? MKCoordinateRegion
-        }
         let globalLibrary = [-135.0, -45.0, 45.0, 135.0].enumerated().map {
             PhotoLocation(id: String($0.offset), coordinate: .init(latitude: 20, longitude: $0.element))
         }
@@ -216,12 +220,11 @@ struct HeatmapRegression {
         model.zoomIn()
         model.resetView()
         RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.15))
-        guard let received, !model.isAnimating,
+        guard !unrelatedReceived, let received, !model.isAnimating,
               abs(received.span.longitudeDelta - map.region.span.longitudeDelta) < 0.000001,
               abs(received.center.longitude - map.region.center.longitude) < 0.000001 else {
             fatalError("FAIL: native All Photos must publish its actual constrained viewport to the heatmap")
         }
-        withExtendedLifetime(observation) {}
         HeatmapMapView.dismantleNSView(map, coordinator: coordinator)
         print("PASS: native rapid zoom and All Photos publish the actual viewport for heatmap regeneration")
     }
@@ -233,7 +236,7 @@ struct HeatmapRegression {
         var now: TimeInterval = 10
         var reducedMotion = false
         func view(_ data: HeatmapData, _ appearance: HeatmapAppearance = .init()) -> HeatmapMapView {
-            HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: data, appearance: appearance)
+            HeatmapMapView(mapViewModel: model, heatmapData: data, appearance: appearance)
         }
         let coordinator = HeatmapMapView.Coordinator(view(data), clock: { now }, reduceMotion: { reducedMotion })
         map.delegate = coordinator

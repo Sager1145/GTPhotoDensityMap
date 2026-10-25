@@ -6,7 +6,13 @@ import CoreGraphics
 @main
 @MainActor
 struct HeatmapScaleRegression {
-    static func main() {
+    static func main() async {
+        let cancelledRasterWasSkipped = await Task.detached {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return HeatmapRasterizer.makeImage(grid: [[1]], maxDensity: 1) == nil
+        }.value
+        check(cancelledRasterWasSkipped, "Superseded raster work must stop without producing an image")
+        print("PASS: cancelled settings preview stops raster work")
         nativePanReuseRegression()
         // Reintroducing a fixed Gaussian radius in grid cells makes this fail:
         // the two viewports differ by 0.2%, but straddle a power-of-two cell boundary.
@@ -15,6 +21,12 @@ struct HeatmapScaleRegression {
         let upper = region(width: threshold * 1.001)
         let location = PhotoLocation(id: "origin", coordinate: .init(latitude: 0, longitude: 0))
         let first = calculate(lower, location)
+        let doubled = PhotoLocationManager.calculateHeatmapData(
+            locations: [location, location], region: lower, radius: 50)
+        check(zip(first.grid, doubled.grid).allSatisfy { original, repeated in
+            zip(original, repeated).allSatisfy { $1 == $0 * 2 }
+        }, "Two colocated photos must contribute twice the density throughout the Gaussian kernel")
+        print("PASS: every photo contributes the same shared Gaussian kernel")
         let second = calculate(upper, location)
         check(second.cellSizeMapPoints == first.cellSizeMapPoints * 2, "fixture must cross the quantized grid boundary")
         let firstSigma = screenSigma(first, region: lower)

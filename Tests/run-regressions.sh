@@ -7,6 +7,7 @@ trap 'rm -rf "$heatmap_test_dir"' EXIT
 xcrun swiftc -parse-as-library -swift-version 5 -o "$heatmap_test_dir/HeatmapRegression" \
   PhotoDensityMap/ContentView.swift \
   PhotoDensityMap/Services/PhotoLocationManager.swift \
+  PhotoDensityMap/Services/HeatmapRasterizer.swift \
   PhotoDensityMap/Models/PhotoCluster.swift \
   PhotoDensityMap/Models/HeatmapAppearance.swift \
   PhotoDensityMap/Views/HeatmapOptionsView.swift \

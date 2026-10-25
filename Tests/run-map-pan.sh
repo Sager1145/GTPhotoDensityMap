@@ -7,6 +7,7 @@ export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode-27.1-RC.app/Contents/D
 xcrun swiftc -parse-as-library -swift-version 5 -module-cache-path "$map_pan_dir/modules" \
   PhotoDensityMap/ContentView.swift \
   PhotoDensityMap/Services/PhotoLocationManager.swift \
+  PhotoDensityMap/Services/HeatmapRasterizer.swift \
   PhotoDensityMap/Models/PhotoCluster.swift \
   PhotoDensityMap/Models/HeatmapAppearance.swift \
   PhotoDensityMap/Views/HeatmapOptionsView.swift \

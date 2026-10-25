@@ -92,3 +92,7 @@ The native toolbar provides map styles, zoom controls, **All Photos**, and **Hot
 - **⌘⇧H**: Open hotspot options
 
 Run `Tests/run-regressions.sh` for rendering and appearance checks and `Tests/run-map-navigation.sh` for viewport and navigation checks with Xcode selected.
+
+## Architecture and feature coverage
+
+See [the interface inventory, architecture review, and verification record](docs/architecture-review.md) for canonical implementations, data ownership, and the requested feature checklist.

@@ -86,7 +86,7 @@ class PhotoLocationManager: ObservableObject {
     /// Controls the radius/spread of heat points (adjustable via UI)
     @Published var heatmapRadius: Double = 50 {
         didSet {
-            regenerateHeatmap(force: true)
+            if heatmapRadius != oldValue { regenerateHeatmap(force: true) }
         }
     }
     
@@ -100,6 +100,7 @@ class PhotoLocationManager: ObservableObject {
         if needsRaster { regenerateHeatmap() }
     }
 
+    private let viewportChanges = PassthroughSubject<Void, Never>()
     private var cancellables = Set<AnyCancellable>()
     private var currentHeatmapTask: Task<Void, Never>?
     private var currentMapRegion: MKCoordinateRegion?
@@ -107,18 +108,18 @@ class PhotoLocationManager: ObservableObject {
     // MARK: - Initialization
     
     init() {
-        // Listen for map region changes to regenerate heatmap
-        NotificationCenter.default.publisher(for: .mapRegionChanged)
+        viewportChanges
             .debounce(for: .milliseconds(200), scheduler: DispatchQueue.main)
-            .sink { [weak self] notification in
-                if let region = notification.object as? MKCoordinateRegion {
-                    self?.currentMapRegion = region
-                    self?.regenerateHeatmap()
-                }
-            }
+            .sink { [weak self] in self?.regenerateHeatmap() }
             .store(in: &cancellables)
     }
-    
+
+    /// Remember the actual camera immediately; debounce only expensive work.
+    func updateMapRegion(_ region: MKCoordinateRegion) {
+        currentMapRegion = region
+        viewportChanges.send()
+    }
+
     // MARK: - Authorization
     
     func requestAuthorization() {
@@ -198,7 +199,9 @@ class PhotoLocationManager: ObservableObject {
                 self.loadedPhotosCount = processedCount
                 self.totalPhotosWithLocation = locations.count
                 self.photoLocations = locations
-                self.generateInitialHeatmap()
+                self.currentHeatmapTask?.cancel()
+                self.heatmapData = nil
+                self.regenerateHeatmap(force: true)
                 self.isLoading = false
             }
         }
@@ -206,19 +209,8 @@ class PhotoLocationManager: ObservableObject {
     
     // MARK: - Heatmap Generation
     
-    private func generateInitialHeatmap() {
-        guard !photoLocations.isEmpty else { return }
-        
-        // Calculate bounding box for all photos
-        let coordinates = photoLocations.map(\.coordinate)
-        if let boundingBox = MKCoordinateRegion.boundingBox(for: coordinates) {
-            currentMapRegion = boundingBox
-            generateHeatmap(for: boundingBox)
-        }
-    }
-    
     private func regenerateHeatmap(force: Bool = false) {
-        guard let region = currentMapRegion else { return }
+        guard !photoLocations.isEmpty, let region = currentMapRegion else { return }
         let visibleRect = Self.projectedRect(for: region)
         if !force, let data = heatmapData,
            data.canReuse(for: visibleRect, cellSize: Self.cellSize(for: visibleRect),
@@ -292,6 +284,14 @@ class PhotoLocationManager: ObservableObject {
         let radiusCells = Int(ceil(kernelRadius))
         let sigma = kernelRadius / 2.5
 
+        // One kernel per snapshot: weights depend on spread and scale, never on
+        // the individual photo. Preserve accumulation order for stable pixels.
+        let kernel = (-radiusCells...radiusCells).flatMap { dx in
+            (-radiusCells...radiusCells).map { dy in
+                let distance = sqrt(Double(dx * dx + dy * dy))
+                return (dx: dx, dy: dy, weight: exp(-(distance * distance) / (2 * sigma * sigma)))
+            }
+        }
         for location in locations {
             guard !Task.isCancelled else { return .empty() }
             let point = MKMapPoint(location.coordinate)
@@ -306,29 +306,19 @@ class PhotoLocationManager: ObservableObject {
                 continue
             }
 
-            // Add heat with Gaussian falloff
-            for dx in -radiusCells...radiusCells {
-                for dy in -radiusCells...radiusCells {
-                    let nx = gridX + dx
-                    let ny = gridY + dy
-                    
-                    guard nx >= 0 && nx < gridWidth && ny >= 0 && ny < gridHeight else {
-                        continue
-                    }
-                    
-                    // Gaussian falloff based on distance
-                    let distance = sqrt(Double(dx * dx + dy * dy))
-                    let weight = exp(-(distance * distance) / (2 * sigma * sigma))
-                    
-                    grid[nx][ny] += weight
-                }
+            for sample in kernel {
+                let nx = gridX + sample.dx
+                let ny = gridY + sample.dy
+                guard nx >= 0 && nx < gridWidth && ny >= 0 && ny < gridHeight else { continue }
+                grid[nx][ny] += sample.weight
             }
         }
-        
+
         // Find maximum density and calculate adaptive normalization
         var maxDensity = 0.0
         var allValues: [Double] = []
         for row in grid {
+            guard !Task.isCancelled else { return .empty() }
             for value in row {
                 maxDensity = max(maxDensity, value)
                 if value > 0 {
@@ -392,13 +382,4 @@ class PhotoLocationManager: ObservableObject {
         pow(2, round(log2(max(rect.width, rect.height) / 150)))
     }
 
-    // MARK: - Statistics
-    
-    var dateRange: (earliest: Date, latest: Date)? {
-        let dates = photoLocations.compactMap(\.creationDate)
-        guard let earliest = dates.min(), let latest = dates.max() else {
-            return nil
-        }
-        return (earliest, latest)
-    }
 }

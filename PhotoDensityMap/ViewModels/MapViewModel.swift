@@ -50,26 +50,17 @@ class MapViewModel: ObservableObject {
     }
 
     @Published private(set) var canFitPhotos = false
-    private var photoLocations: [PhotoLocation] = []
+    private var photoRegion: MKCoordinateRegion?
     private var didFitInitialPhotos = false
     private var pendingZoomRegion: MKCoordinateRegion?
     private var lastZoomInputTime: TimeInterval?
     private let reduceMotion: () -> Bool
     private let clock: () -> TimeInterval
-    
-    private var cancellables = Set<AnyCancellable>()
-    
+
     init(reduceMotion: @escaping () -> Bool = { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion },
          clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.reduceMotion = reduceMotion
         self.clock = clock
-        // Observe map style changes
-        $mapStyle
-            .dropFirst() // Skip the initial value since it's already set
-            .sink { [weak self] style in
-                self?.mapView?.mapType = style.mapType
-            }
-            .store(in: &cancellables)
     }
     
     // MARK: - Map Controls
@@ -92,17 +83,17 @@ class MapViewModel: ObservableObject {
         lastZoomInputTime = now
     }
 
-    /// Cache the complete loaded library and fit once, without undoing later pans.
+    /// Cache the library fit once per update, without undoing later pans.
     func updatePhotoLocations(_ locations: [PhotoLocation]) {
-        photoLocations = locations
-        canFitPhotos = !locations.isEmpty
+        photoRegion = Self.fittedRegion(for: locations)
+        canFitPhotos = photoRegion != nil
         guard !didFitInitialPhotos, canFitPhotos else { return }
         didFitInitialPhotos = true
-        fitToShow(locations: locations, animated: false)
+        if let photoRegion { setRegion(photoRegion, animated: false) }
     }
 
     func resetView() {
-        fitToShow(locations: photoLocations)
+        if let photoRegion { setRegion(photoRegion, animated: true) }
     }
 
     func showWorld() {
@@ -112,17 +103,9 @@ class MapViewModel: ObservableObject {
         ), animated: true)
     }
 
-    func centerOn(coordinate: CLLocationCoordinate2D, span: MKCoordinateSpan? = nil) {
-        let region = MKCoordinateRegion(
-            center: coordinate,
-            span: span ?? MKCoordinateSpan(latitudeDelta: 0.5, longitudeDelta: 0.5)
-        )
-        setRegion(region, animated: true)
-    }
-    
-    func fitToShow(locations: [PhotoLocation], animated: Bool = true) {
+    private static func fittedRegion(for locations: [PhotoLocation]) -> MKCoordinateRegion? {
         let coordinates = locations.map(\.coordinate).filter { CLLocationCoordinate2DIsValid($0) }
-        guard !coordinates.isEmpty else { return }
+        guard !coordinates.isEmpty else { return nil }
 
         // The complement of the largest longitude gap is the shortest arc that
         // contains the library, including photos on both sides of the date line.
@@ -145,11 +128,11 @@ class MapViewModel: ObservableObject {
         let latitudeSpan = min(170, max(0.05, (maxLatitude - minLatitude) * 1.3))
         let latitudeCenter = min(85 - latitudeSpan / 2,
                                  max(-85 + latitudeSpan / 2, (minLatitude + maxLatitude) / 2))
-        setRegion(MKCoordinateRegion(
+        return MKCoordinateRegion(
             center: CLLocationCoordinate2D(latitude: latitudeCenter, longitude: longitudeCenter),
             span: MKCoordinateSpan(latitudeDelta: latitudeSpan,
                                    longitudeDelta: min(360, max(0.05, longitudeRange * 1.3)))
-        ), animated: animated)
+        )
     }
 
     private func setRegion(_ region: MKCoordinateRegion, animated: Bool) {
@@ -177,22 +160,4 @@ class MapViewModel: ObservableObject {
         currentRegion = region
     }
 
-    // MARK: - Zoom Level Calculation
-    
-    /// Returns a zoom level from 0 (world) to 20 (building level)
-    var currentZoomLevel: Double {
-        guard let mapView = mapView else { return 10 }
-        
-        let longitudeDelta = mapView.region.span.longitudeDelta
-        let zoomLevel = log2(360 / longitudeDelta)
-        return max(0, min(20, zoomLevel))
-    }
-    
-    /// Clustering radius in meters based on current zoom level
-    var clusteringRadius: Double {
-        // At zoom level 0 (world view), large radius
-        // At zoom level 20 (street level), small radius
-        let baseRadius = 50000.0 // 50km at zoom 0
-        return baseRadius / pow(2, currentZoomLevel / 2)
-    }
 }

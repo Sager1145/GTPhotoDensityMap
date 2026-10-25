@@ -12,9 +12,9 @@ struct MapPanRegression {
                                         span: .init(latitudeDelta: 1, longitudeDelta: 1))
         let data = PhotoLocationManager.calculateHeatmapData(locations: [location], region: region, radius: 50)
         let model = MapViewModel(reduceMotion: { false })
-        model.centerOn(coordinate: region.center, span: region.span)
+        model.mapRegionDidChange(region)
         let host = NSHostingView(rootView: HeatmapMapView(
-            mapViewModel: model, photoLocations: [location], heatmapData: data))
+            mapViewModel: model, heatmapData: data))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1000, height: 700),
                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.contentView = host

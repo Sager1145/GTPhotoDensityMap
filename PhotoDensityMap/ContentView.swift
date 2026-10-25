@@ -18,9 +18,9 @@ struct ContentView: View {
         ZStack {
             HeatmapMapView(
                 mapViewModel: mapViewModel,
-                photoLocations: photoManager.photoLocations,
                 heatmapData: photoManager.heatmapData,
-                appearance: heatmapAppearance
+                appearance: heatmapAppearance,
+                onRegionChange: photoManager.updateMapRegion
             )
 
             if photoManager.authorizationStatus == .notDetermined ||
@@ -55,8 +55,8 @@ struct ContentView: View {
         .onAppear {
             photoManager.requestAuthorization()
         }
-        .onChange(of: photoManager.photoLocations.count, initial: true) { _, _ in
-            mapViewModel.updatePhotoLocations(photoManager.photoLocations)
+        .onReceive(photoManager.$photoLocations) { locations in
+            mapViewModel.updatePhotoLocations(locations)
         }
         .onReceive(NotificationCenter.default.publisher(for: .zoomIn)) { _ in
             mapViewModel.zoomIn()
@@ -77,9 +77,9 @@ struct ContentView: View {
 
 struct HeatmapMapView: NSViewRepresentable {
     @ObservedObject var mapViewModel: MapViewModel
-    let photoLocations: [PhotoLocation]
     let heatmapData: HeatmapData?
     var appearance: HeatmapAppearance = HeatmapAppearance()
+    var onRegionChange: (MKCoordinateRegion) -> Void = { _ in }
     
     func makeNSView(context: Context) -> MKMapView {
         let mapView = MKMapView()
@@ -157,7 +157,7 @@ struct HeatmapMapView: NSViewRepresentable {
         }
 
         func updateHeatmap(on mapView: MKMapView) {
-            guard let data = parent.heatmapData, !parent.photoLocations.isEmpty else {
+            guard let data = parent.heatmapData else {
                 clear(on: mapView)
                 return
             }
@@ -322,7 +322,7 @@ struct HeatmapMapView: NSViewRepresentable {
                 guard let self, let mapView, mapView.delegate === self else { return }
                 let actualRegion = mapView.region
                 self.parent.mapViewModel.mapRegionDidChange(actualRegion)
-                NotificationCenter.default.post(name: .mapRegionChanged, object: actualRegion)
+                self.parent.onRegionChange(actualRegion)
             }
         }
     }
@@ -407,79 +407,6 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
         }
         
         context.restoreGState()
-    }
-    
-}
-
-// Rasterize each immutable snapshot once, before publishing it to the UI.
-enum HeatmapRasterizer {
-    static func makeImage(grid: [[Double]], maxDensity: Double, appearance: HeatmapAppearance = HeatmapAppearance(), smoothingScale: Double = 1) -> CGImage? {
-        let gridWidth = grid.count
-        let gridHeight = grid.first?.count ?? 0
-        guard gridWidth > 0, gridHeight > 0 else { return nil }
-        // Resolution belongs to the grid, not a changing map-space draw rect.
-        let width = gridWidth * 4
-        let height = gridHeight * 4
-        
-        // Create bitmap context
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: colorSpace,
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return nil }
-        
-        // Clear background
-        context.clear(CGRect(x: 0, y: 0, width: width, height: height))
-        
-        let cellWidth = CGFloat(width) / CGFloat(gridWidth)
-        let cellHeight = CGFloat(height) / CGFloat(gridHeight)
-        
-        // Draw each cell with interpolated colors
-        for x in 0..<gridWidth {
-            for y in 0..<gridHeight {
-                let density = grid[x][y]
-                if density > 0 {
-                    let color = appearance.palette.color(at: appearance.normalizedDensity(density / max(maxDensity, .leastNonzeroMagnitude)))
-                    context.setFillColor(CGColor(red: color.red, green: color.green, blue: color.blue, alpha: color.alpha))
-                    
-                    // Draw cell with slight overlap for smoother appearance
-                    let rect = CGRect(
-                        x: CGFloat(x) * cellWidth - 1,
-                        y: CGFloat(y) * cellHeight - 1,
-                        width: cellWidth + 2,
-                        height: cellHeight + 2
-                    )
-                    context.fillEllipse(in: rect.insetBy(dx: -cellWidth * 0.5, dy: -cellHeight * 0.5))
-                }
-            }
-        }
-        
-        // Apply Gaussian blur for smooth gradient effect
-        if let image = context.makeImage() {
-            return appearance.smoothing == 0 ? image : applyBlur(to: image, radius: max(cellWidth, cellHeight) * appearance.smoothing * smoothingScale)
-        }
-        
-        return context.makeImage()
-    }
-    
-    private static func applyBlur(to image: CGImage, radius: CGFloat) -> CGImage? {
-        let ciImage = CIImage(cgImage: image)
-        
-        let filter = CIFilter(name: "CIGaussianBlur")
-        filter?.setValue(ciImage, forKey: kCIInputImageKey)
-        filter?.setValue(radius, forKey: kCIInputRadiusKey)
-        
-        guard let outputImage = filter?.outputImage else { return image }
-        
-        let ciContext = CIContext()
-        let extent = ciImage.extent
-        
-        return ciContext.createCGImage(outputImage, from: extent)
     }
     
 }
@@ -673,12 +600,6 @@ struct AuthorizationOverlay: View {
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
         }
     }
-}
-
-// MARK: - Notification Extension
-
-extension Notification.Name {
-    static let mapRegionChanged = Notification.Name("mapRegionChanged")
 }
 
 #Preview {
