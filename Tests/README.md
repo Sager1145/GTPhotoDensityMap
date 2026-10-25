@@ -8,8 +8,9 @@ bash Tests/run-all.sh
 
 The runner executes every committed regression program and stops with a nonzero exit code on failure:
 
-- `run-regressions.sh`: heatmap rendering, immutable raster reuse, geographic anchoring, transition lifecycle, rapid updates, appearance controls, and native viewport notifications; also runs the standalone palette/appearance checks.
+- `run-regressions.sh`: heatmap rendering, immutable raster reuse, geographic anchoring, transition lifecycle, rapid updates, live opacity/raster previews without overlay replacement, appearance controls, and native viewport notifications; also runs the standalone palette/appearance checks.
 - `run-map-navigation.sh`: initial fit, All Photos, date-line bounds, zoom limits, rapid/reverse zoom, Reduce Motion, and native MapKit camera clamping.
+- `run-heatmap-scale.sh`: continuous Gaussian spread and smoothing across grid quantization boundaries, zoom round trips, and same-scale pan cache reuse.
 - `run-map-pan.sh`: 120 continuous native MapKit viewport movements, hotspot projection tracking, hit testing, and overlay/image identity.
 
 These tests use synthetic photo coordinates and do not request access to the Photos library. The native pan test uses a hidden layout host; it verifies programmatic panning and cached rendering, not physical mouse-event delivery or screen frame rate.

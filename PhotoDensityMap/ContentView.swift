@@ -162,6 +162,28 @@ struct HeatmapMapView: NSViewRepresentable {
                 return
             }
             let appearance = parent.appearance
+            // Settings previews change pixels, not geography. Keep the native
+            // renderer installed: crossfading translucent copies dims their
+            // overlap, and queuing fades makes sliders lag behind the pointer.
+            if let target = incoming ?? displayed,
+               MKMapRectEqualToRect(target.boundingMapRect, data.mapRect),
+               target.heatmapData.cellSizeMapPoints == data.cellSizeMapPoints,
+               ((target.heatmapData.id == data.id && target.appearance.opacity != appearance.opacity) ||
+                !target.heatmapData.appearance.hasSameRaster(as: data.appearance) ||
+                target.heatmapData.radius != data.radius) {
+                transitionTimer?.invalidate()
+                transitionTimer = nil
+                pending = nil
+                let targetRenderer = renderer(for: target)
+                target.updatePreview(data: data, appearance: appearance)
+                targetRenderer.updatePreview(image: data.image, opacity: appearance.opacity)
+                targetRenderer.alpha = 1
+                mapView.removeOverlays(mapView.overlays.filter { $0 is HeatmapOverlay && $0 !== target })
+                renderers = [ObjectIdentifier(target): targetRenderer]
+                displayed = target
+                incoming = nil
+                return
+            }
             if reduceMotion() {
                 replaceImmediately(on: mapView, data: data, appearance: appearance)
                 return
@@ -309,39 +331,63 @@ struct HeatmapMapView: NSViewRepresentable {
 // MARK: - Heatmap Overlay
 
 class HeatmapOverlay: NSObject, MKOverlay {
-    let heatmapData: HeatmapData
-    let appearance: HeatmapAppearance
+    // Preview metadata is updated only by the main-actor coordinator. Tile
+    // drawing reads the renderer's synchronized snapshot and fixed mapRect.
+    private(set) var heatmapData: HeatmapData
+    private(set) var appearance: HeatmapAppearance
+    private let mapRect: MKMapRect
     
     var coordinate: CLLocationCoordinate2D {
         MKMapPoint(x: boundingMapRect.midX, y: boundingMapRect.midY).coordinate
     }
 
-    var boundingMapRect: MKMapRect { heatmapData.mapRect }
+    var boundingMapRect: MKMapRect { mapRect }
 
     init(heatmapData: HeatmapData, appearance: HeatmapAppearance = HeatmapAppearance()) {
         self.heatmapData = heatmapData
         self.appearance = appearance
+        self.mapRect = heatmapData.mapRect
         super.init()
+    }
+
+    @MainActor
+    func updatePreview(data: HeatmapData, appearance: HeatmapAppearance) {
+        precondition(MKMapRectEqualToRect(mapRect, data.mapRect))
+        heatmapData = data
+        self.appearance = appearance
     }
 }
 
 // MARK: - Heatmap Overlay Renderer
 
 class HeatmapOverlayRenderer: MKOverlayRenderer {
-    // Immutable after initialization: MapKit may draw tiles concurrently.
-    let heatmapImage: CGImage?
+    // MapKit can draw multiple tiles concurrently while the main thread
+    // publishes a preview. Read image and opacity together under the same lock.
+    private let snapshotLock = NSLock()
+    private var snapshot: (image: CGImage?, opacity: Double)
+
+    var heatmapImage: CGImage? {
+        snapshotLock.lock()
+        defer { snapshotLock.unlock() }
+        return snapshot.image
+    }
 
     override init(overlay: MKOverlay) {
-        if let heatmap = overlay as? HeatmapOverlay {
-            heatmapImage = heatmap.heatmapData.image
-        } else {
-            heatmapImage = nil
-        }
+        let heatmap = overlay as? HeatmapOverlay
+        snapshot = (heatmap?.heatmapData.image, heatmap?.appearance.opacity ?? 0.7)
         super.init(overlay: overlay)
     }
-    
+
+    @MainActor
+    func updatePreview(image: CGImage?, opacity: Double) {
+        snapshotLock.lock()
+        snapshot = (image, opacity)
+        snapshotLock.unlock()
+        setNeedsDisplay()
+    }
+
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale, in context: CGContext) {
-        guard let heatmapOverlay = overlay as? HeatmapOverlay else { return }
+        guard overlay is HeatmapOverlay else { return }
         
         let overlayRect = overlay.boundingMapRect
         
@@ -350,10 +396,13 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
         
         // Draw the heatmap
         context.saveGState()
-        context.setAlpha(heatmapOverlay.appearance.opacity)
+        snapshotLock.lock()
+        let frame = snapshot
+        snapshotLock.unlock()
+        context.setAlpha(frame.opacity)
         
         context.interpolationQuality = .high
-        if let image = heatmapImage {
+        if let image = frame.image {
             context.draw(image, in: drawRect)
         }
         
@@ -364,7 +413,7 @@ class HeatmapOverlayRenderer: MKOverlayRenderer {
 
 // Rasterize each immutable snapshot once, before publishing it to the UI.
 enum HeatmapRasterizer {
-    static func makeImage(grid: [[Double]], maxDensity: Double, appearance: HeatmapAppearance = HeatmapAppearance()) -> CGImage? {
+    static func makeImage(grid: [[Double]], maxDensity: Double, appearance: HeatmapAppearance = HeatmapAppearance(), smoothingScale: Double = 1) -> CGImage? {
         let gridWidth = grid.count
         let gridHeight = grid.first?.count ?? 0
         guard gridWidth > 0, gridHeight > 0 else { return nil }
@@ -412,7 +461,7 @@ enum HeatmapRasterizer {
         
         // Apply Gaussian blur for smooth gradient effect
         if let image = context.makeImage() {
-            return appearance.smoothing == 0 ? image : applyBlur(to: image, radius: max(cellWidth, cellHeight) * appearance.smoothing)
+            return appearance.smoothing == 0 ? image : applyBlur(to: image, radius: max(cellWidth, cellHeight) * appearance.smoothing * smoothingScale)
         }
         
         return context.makeImage()

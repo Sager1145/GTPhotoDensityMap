@@ -23,12 +23,15 @@ struct HeatmapData {
     let cellSizeMapPoints: Double
     let image: CGImage?
     let radius: Double
+    /// Continuous viewport scale relative to the quantized world grid.
+    let kernelScale: Double
     let appearance: HeatmapAppearance
 
     init(grid: [[Double]], gridWidth: Int, gridHeight: Int, mapRect: MKMapRect,
-         maxDensity: Double, cellSizeMapPoints: Double, radius: Double = 50, appearance: HeatmapAppearance = HeatmapAppearance()) {
+         maxDensity: Double, cellSizeMapPoints: Double, radius: Double = 50, appearance: HeatmapAppearance = HeatmapAppearance(), kernelScale: Double = 1) {
         self.appearance = appearance
         self.radius = radius
+        self.kernelScale = kernelScale
         self.grid = grid
         self.gridWidth = gridWidth
         self.gridHeight = gridHeight
@@ -36,17 +39,22 @@ struct HeatmapData {
         self.maxDensity = maxDensity
         self.cellSizeMapPoints = cellSizeMapPoints
         // Density calculation and raster preparation both run on the worker.
-        self.image = HeatmapRasterizer.makeImage(grid: grid, maxDensity: maxDensity, appearance: appearance)
+        self.image = HeatmapRasterizer.makeImage(grid: grid, maxDensity: maxDensity, appearance: appearance, smoothingScale: kernelScale)
     }
     
     func canReuse(for rect: MKMapRect, cellSize: Double, radius: Double) -> Bool {
-        self.radius == radius && cellSizeMapPoints == cellSize && mapRect.contains(rect)
+        let requestedScale = PhotoLocationManager.kernelScale(for: rect, cellSize: cellSize)
+        // MapKit's region bounds reconstruct a slightly different projected
+        // scale during a constant-scale pan. Allow 0.5% drift: at the default
+        // 16px Gaussian sigma on a 1000px viewport this is at most 0.08px.
+        return self.radius == radius && cellSizeMapPoints == cellSize &&
+            abs(kernelScale - requestedScale) <= kernelScale * 0.005 && mapRect.contains(rect)
     }
 
     func restyled(_ appearance: HeatmapAppearance) -> HeatmapData {
         HeatmapData(grid: grid, gridWidth: gridWidth, gridHeight: gridHeight,
                     mapRect: mapRect, maxDensity: maxDensity, cellSizeMapPoints: cellSizeMapPoints,
-                    radius: radius, appearance: appearance)
+                    radius: radius, appearance: appearance, kernelScale: kernelScale)
     }
 
     static func empty() -> HeatmapData {
@@ -277,7 +285,12 @@ class PhotoLocationManager: ObservableObject {
                                width: Double(gridWidth) * cellSize,
                                height: Double(gridHeight) * cellSize)
         var grid = Array(repeating: Array(repeating: 0.0, count: gridHeight), count: gridWidth)
-        let radiusCells = Int(radius / 10) + 1
+        // Keep the spread continuous when the world grid moves between powers
+        // of two. Quantization changes sampling resolution, not visual radius.
+        let kernelScale = kernelScale(for: visibleRect, cellSize: cellSize)
+        let kernelRadius = (radius / 10 + 1) * kernelScale
+        let radiusCells = Int(ceil(kernelRadius))
+        let sigma = kernelRadius / 2.5
 
         for location in locations {
             guard !Task.isCancelled else { return .empty() }
@@ -305,7 +318,6 @@ class PhotoLocationManager: ObservableObject {
                     
                     // Gaussian falloff based on distance
                     let distance = sqrt(Double(dx * dx + dy * dy))
-                    let sigma = Double(radiusCells) / 2.5
                     let weight = exp(-(distance * distance) / (2 * sigma * sigma))
                     
                     grid[nx][ny] += weight
@@ -357,7 +369,7 @@ class PhotoLocationManager: ObservableObject {
             gridHeight: gridHeight,
             mapRect: mapRect,
             maxDensity: normalizedMaxDensity,
-            cellSizeMapPoints: cellSize, radius: radius, appearance: appearance
+            cellSizeMapPoints: cellSize, radius: radius, appearance: appearance, kernelScale: kernelScale
         )
     }
     
@@ -369,6 +381,10 @@ class PhotoLocationManager: ObservableObject {
         let width = max(1, MKMapRect.world.width * min(360, region.span.longitudeDelta) / 360)
         return MKMapRect(x: top.x - width / 2, y: top.y,
                          width: width, height: max(1, bottom.y - top.y))
+    }
+
+    nonisolated static func kernelScale(for rect: MKMapRect, cellSize: Double) -> Double {
+        max(rect.width, rect.height) / 150 / cellSize
     }
 
     nonisolated static func cellSize(for rect: MKMapRect) -> Double {

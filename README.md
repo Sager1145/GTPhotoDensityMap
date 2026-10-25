@@ -71,7 +71,7 @@ Contributions are welcome! Feel free to open issues or submit pull requests.
 
 ## Heatmap options
 
-Use **Hotspots** in the map toolbar to open the options panel. Spread is relative to the density grid in the current viewport, not a distance in meters or a pixel radius. Opacity, intensity, smoothing, and colors update the existing density grid without reading the photo library again. The legend follows the selected palette. Defaults preserve the original appearance: spread 50, opacity 70%, intensity 1×, smoothing 1×, and Classic colors.
+Use **Hotspots** in the map toolbar to open the options panel. Spread is relative to the current viewport, not a distance in meters or a fixed pixel radius. Its scale stays continuous when the density grid changes resolution during zooming. Opacity, intensity, smoothing, and colors preview through the existing map renderer without reading the photo library again. Opacity reuses the current raster; intensity, smoothing, and colors rasterize the cached density grid in the background. The legend follows the selected palette. Defaults preserve the original appearance: spread 50, opacity 70%, intensity 1×, smoothing 1×, and Classic colors.
 
 See [the heatmap options research](docs/heatmap-options-research.md) for the Leaflet.heat, MapLibre, and Kepler.gl references.
 

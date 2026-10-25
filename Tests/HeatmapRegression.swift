@@ -16,6 +16,7 @@ struct HeatmapRegression {
                                span: .init(latitudeDelta: 10, longitudeDelta: 10))),
             maxDensity: 1, cellSizeMapPoints: 1
         )
+        sliderPreviewChecks(location: location, data: data)
         transitionChecks(location: location, data: data)
         nativeViewportChecks(location: location, data: data)
         let host = NSHostingView(rootView: HeatmapMapView(
@@ -116,6 +117,84 @@ struct HeatmapRegression {
     }
 
     @MainActor
+    static func sliderPreviewChecks(location: PhotoLocation, data: HeatmapData) {
+        let model = MapViewModel()
+        let map = MKMapView(frame: NSRect(x: 0, y: 0, width: 800, height: 600))
+        func view(_ data: HeatmapData, _ appearance: HeatmapAppearance) -> HeatmapMapView {
+            HeatmapMapView(mapViewModel: model, photoLocations: [location], heatmapData: data, appearance: appearance)
+        }
+        var appearance = HeatmapAppearance()
+        let coordinator = HeatmapMapView.Coordinator(view(data, appearance), reduceMotion: { false })
+        map.delegate = coordinator
+        coordinator.updateHeatmap(on: map)
+        guard let original = map.overlays.first as? HeatmapOverlay,
+              let renderer = coordinator.mapView(map, rendererFor: original) as? HeatmapOverlayRenderer else {
+            fatalError("FAIL: preview fixture needs an initial renderer")
+        }
+        func alphaSum() -> Double {
+            let width = 64
+            let context = CGContext(data: nil, width: width, height: width,
+                                    bitsPerComponent: 8, bytesPerRow: width * 4,
+                                    space: CGColorSpaceCreateDeviceRGB(),
+                                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)!
+            let rect = renderer.rect(for: data.mapRect)
+            context.scaleBy(x: CGFloat(width) / rect.width, y: CGFloat(width) / rect.height)
+            context.translateBy(x: -rect.minX, y: -rect.minY)
+            renderer.draw(data.mapRect, zoomScale: 1, in: context)
+            let bytes = context.data!.assumingMemoryBound(to: UInt8.self)
+            return (0..<(width * width)).reduce(0) { $0 + Double(bytes[$1 * 4 + 3]) }
+        }
+        let baselineAlpha = alphaSum()
+        guard baselineAlpha > 0 else { fatalError("FAIL: preview pixel fixture must contain heat") }
+        for opacity in [0.6, 0.4, 0, 0.1, 0.8, 0.7] {
+            appearance.opacity = opacity
+            coordinator.parent = view(data, appearance)
+            coordinator.updateHeatmap(on: map)
+            guard map.overlays.count == 1, map.overlays.first === original,
+                  coordinator.mapView(map, rendererFor: original) === renderer,
+                  renderer.alpha == 1 else {
+                fatalError("FAIL: opacity slider must update one renderer without starting a dimming crossfade")
+            }
+            guard abs(alphaSum() / baselineAlpha - opacity / 0.7) < 0.04 else {
+                fatalError("FAIL: preview pixels must follow current opacity without lag or double compositing")
+            }
+        }
+        for intensity in [1.1, 1.4, 2.0, 0.8] {
+            appearance.intensity = intensity
+            let next = data.restyled(appearance)
+            coordinator.parent = view(next, appearance)
+            coordinator.updateHeatmap(on: map)
+            guard map.overlays.count == 1, map.overlays.first === original,
+                  renderer.heatmapImage === next.image, original.heatmapData.id == next.id else {
+                fatalError("FAIL: appearance preview must immediately reuse the current renderer and latest raster")
+            }
+        }
+        coordinator.advanceTransition(on: map, at: ProcessInfo.processInfo.systemUptime + 10)
+        guard map.overlays.count == 1, map.overlays.first === original else {
+            fatalError("FAIL: stale preview transition must not restore an old snapshot")
+        }
+        let shifted = HeatmapData(grid: data.grid, gridWidth: data.gridWidth, gridHeight: data.gridHeight,
+                                  mapRect: MKMapRect(x: data.mapRect.minX + data.mapRect.width * 0.01, y: data.mapRect.minY,
+                                                     width: data.mapRect.width, height: data.mapRect.height),
+                                  maxDensity: data.maxDensity, cellSizeMapPoints: data.cellSizeMapPoints,
+                                  appearance: appearance)
+        coordinator.parent = view(shifted, appearance)
+        coordinator.updateHeatmap(on: map)
+        guard map.overlays.count == 2 else { fatalError("FAIL: fixture must begin a viewport transition") }
+        appearance.opacity = 0.3
+        coordinator.parent = view(shifted, appearance)
+        coordinator.updateHeatmap(on: map)
+        coordinator.advanceTransition(on: map, at: ProcessInfo.processInfo.systemUptime + 10)
+        guard map.overlays.count == 1,
+              (map.overlays.first as? HeatmapOverlay)?.heatmapData.id == shifted.id,
+              (map.overlays.first as? HeatmapOverlay)?.appearance.opacity == 0.3 else {
+            fatalError("FAIL: settings during a viewport fade must discard pending frames and keep the latest preview")
+        }
+        HeatmapMapView.dismantleNSView(map, coordinator: coordinator)
+        print("PASS: continuous opacity and intensity previews retain one renderer without crossfade dimming")
+    }
+
+    @MainActor
     static func nativeViewportChecks(location: PhotoLocation, data: HeatmapData) {
         let model = MapViewModel(reduceMotion: { false })
         let map = MKMapView(frame: NSRect(x: 0, y: 0, width: 1000, height: 700))
@@ -162,7 +241,14 @@ struct HeatmapRegression {
         guard let original = map.overlays.first as? HeatmapOverlay else { fatalError("FAIL: initial image missing") }
         var appearance = HeatmapAppearance()
         appearance.palette = .ember
-        let second = data.restyled(appearance)
+        func viewportData(_ shift: Double, _ appearance: HeatmapAppearance) -> HeatmapData {
+            HeatmapData(grid: data.grid, gridWidth: data.gridWidth, gridHeight: data.gridHeight,
+                        mapRect: MKMapRect(x: data.mapRect.minX + shift, y: data.mapRect.minY,
+                                          width: data.mapRect.width, height: data.mapRect.height),
+                        maxDensity: data.maxDensity, cellSizeMapPoints: data.cellSizeMapPoints,
+                        appearance: appearance)
+        }
+        let second = viewportData(data.mapRect.width * 0.01, appearance)
         coordinator.parent = view(second, appearance)
         coordinator.updateHeatmap(on: map)
         guard map.overlays.count == 2, map.overlays.contains(where: { $0 === original }),
@@ -181,14 +267,19 @@ struct HeatmapRegression {
               (incomingRenderer as? HeatmapOverlayRenderer)?.heatmapImage === second.image else {
             fatalError("FAIL: halfway transition must blend existing cached images")
         }
+        coordinator.updateHeatmap(on: map)
+        guard map.overlays.count == 2, abs(outgoingRenderer.alpha - 0.5) < 0.01,
+              abs(incomingRenderer.alpha - 0.5) < 0.01 else {
+            fatalError("FAIL: unchanged view updates must not interrupt an active viewport blend")
+        }
         print("PASS: deterministic crossfade retains and blends the cached geographic images")
 
         appearance.intensity = 1.5
-        let skipped = data.restyled(appearance)
+        let skipped = viewportData(data.mapRect.width * 0.02, appearance)
         coordinator.parent = view(skipped, appearance)
         coordinator.updateHeatmap(on: map)
         appearance.intensity = 2
-        let latest = data.restyled(appearance)
+        let latest = viewportData(data.mapRect.width * 0.03, appearance)
         coordinator.parent = view(latest, appearance)
         for _ in 0..<20 { coordinator.updateHeatmap(on: map) }
         guard map.overlays.count == 2 else { fatalError("FAIL: rapid updates accumulated overlays") }
